@@ -11,6 +11,7 @@
  *          successor remains MediaProjection + a MediaCodec encode device via the JNI bridge.
  */
 // standard includes
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include "src/platform/android/jni_bridge.h"
 #include "src/platform/common.h"
 #include "src/logging.h"
+#include "src/video.h"
 
 using namespace std::literals;
 
@@ -38,7 +40,6 @@ namespace platf {
     constexpr int BYTES_PER_PIXEL = 4;  ///< Bytes per pixel for the 32-bpp capture buffer.
     constexpr auto SCREENCAP_PATH = "/system/bin/screencap";  ///< Path to the Android screencap tool.
     constexpr auto FRAMEBUFFER_PATH = "/dev/graphics/fb0";  ///< Path to the Linux framebuffer device.
-    constexpr auto TARGET_FRAME_INTERVAL = 16667us;  ///< Capture pacing floor (~60 fps).
 
     /**
      * @brief Parsed screencap raw header.
@@ -127,6 +128,8 @@ namespace platf {
     // screencap fallback state.
     std::vector<std::uint8_t> capture_buf;  ///< Reused buffer for raw screencap output.
 
+    std::chrono::nanoseconds delay {std::chrono::milliseconds(16)};  ///< Per-frame interval from the client framerate.
+
     ~android_display_t() override {
       if (fb_mem && fb_mem != MAP_FAILED) {
         munmap(fb_mem, fb_size);
@@ -194,26 +197,28 @@ namespace platf {
 
       const std::uint8_t *src = fb_mem + src_off;
       std::uint8_t *dst = img->data;
-      if (!fb_swap_rb && fb_stride == img->row_pitch) {
+
+      // Read the framebuffer with a single bulk memcpy (sequential burst reads) rather than
+      // scattered byte accesses, then apply any R/B swap on the now-cached copy. Note: on an
+      // emulated/software-rendered display the readback itself is bandwidth-bound (~tens of ms
+      // for a full frame), which caps the achievable capture rate regardless of access pattern.
+      if (fb_stride == img->row_pitch) {
         std::memcpy(dst, src, static_cast<std::size_t>(img->row_pitch) * height);
-        return true;
+      } else {
+        const std::size_t row_bytes = static_cast<std::size_t>(width) * BYTES_PER_PIXEL;
+        for (int y = 0; y < height; ++y) {
+          std::memcpy(dst + static_cast<std::size_t>(y) * img->row_pitch,
+                      src + static_cast<std::size_t>(y) * fb_stride,
+                      row_bytes);
+        }
       }
-      for (int y = 0; y < height; ++y) {
-        const std::uint8_t *s = src + static_cast<std::size_t>(y) * fb_stride;
-        std::uint8_t *d = dst + static_cast<std::size_t>(y) * img->row_pitch;
-        for (int x = 0; x < width; ++x) {
-          if (fb_swap_rb) {
-            d[0] = s[2];  // B
-            d[1] = s[1];  // G
-            d[2] = s[0];  // R
-          } else {
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-          }
-          d[3] = 0;  // X
-          s += 4;
-          d += 4;
+
+      if (fb_swap_rb) {
+        // Swap R and B in place in cached memory (fast). BGR0 ignores the 4th byte.
+        const std::size_t px = static_cast<std::size_t>(width) * height;
+        for (std::size_t i = 0; i < px; ++i) {
+          std::uint8_t *p = dst + i * 4;
+          std::swap(p[0], p[2]);
         }
       }
       return true;
@@ -253,8 +258,23 @@ namespace platf {
     }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      // Pace to the client-requested framerate, phase-locked to a steady clock (mirrors the Linux
+      // backends). A fixed accumulator avoids the aliasing that an independent per-frame sleep
+      // causes against the encoder's own pacing.
+      auto next_frame = std::chrono::steady_clock::now();
+      sleep_overshoot_logger.reset();
+
       while (true) {
-        auto frame_start = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (next_frame > now) {
+          std::this_thread::sleep_for(next_frame - now);
+          sleep_overshoot_logger.first_point(next_frame);
+          sleep_overshoot_logger.second_point_now_and_log();
+        }
+        next_frame += delay;
+        if (next_frame < now) {  // fell behind; resync to avoid a burst of catch-up frames
+          next_frame = now + delay;
+        }
 
         std::shared_ptr<img_t> img;
         if (!pull_free_image_cb(img)) {
@@ -268,12 +288,6 @@ namespace platf {
 
         if (!push_captured_image_cb(std::move(img), true)) {
           return capture_e::ok;  // break requested
-        }
-
-        // Pace to the target frame interval; the encoder's image pool also applies backpressure.
-        auto elapsed = std::chrono::steady_clock::now() - frame_start;
-        if (elapsed < TARGET_FRAME_INTERVAL) {
-          std::this_thread::sleep_for(TARGET_FRAME_INTERVAL - elapsed);
         }
       }
     }
@@ -308,6 +322,7 @@ namespace platf {
 
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     auto disp = std::make_shared<android_display_t>();
+    disp->delay = video::capture_frame_interval(config);
 
     // Prefer the direct framebuffer (fast, persistent). Fall back to screencap.
     if (!disp->init_framebuffer()) {
