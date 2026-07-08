@@ -19,6 +19,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS_PREFIX="$PWD/android-deps/$ABI"
 FFMPEG_PREFIX="$PWD/ffmpeg-android/$ABI/ffmpeg"
 
+# On-device install prefix. SUNSHINE_ASSETS_DIR is derived from CMAKE_INSTALL_PREFIX, so pointing
+# it at a writable/pushable device path (rather than the desktop default /usr/local) is what lets
+# the config, web assets, and state files live somewhere the Web UI can actually serve them.
+DEVICE_PREFIX=${DEVICE_PREFIX:-/data/local/tmp/sunshine}
+
 ABI="$ABI" API="$API" PREFIX="$DEPS_PREFIX" bash "$HERE/build-deps.sh"
 ABI="$ABI" API="$API" OUT="$FFMPEG_PREFIX" bash "$HERE/build-ffmpeg.sh"
 
@@ -34,12 +39,18 @@ Configure Sunshine (run from the repo root):
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android.cmake \\
     -DANDROID_ABI=$ABI \\
     -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF \\
+    -DCMAKE_INSTALL_PREFIX=$DEVICE_PREFIX \\
     -DFFMPEG_PREPARED_BINARIES="$FFMPEG_PREFIX" \\
     -DOPENSSL_ROOT_DIR="$DEPS_PREFIX" \\
     -DOpus_ROOT_DIR="$DEPS_PREFIX" -DOPUS_USE_STATIC=ON \\
     -DCMAKE_PREFIX_PATH="$DEPS_PREFIX" \\
     -DCMAKE_FIND_ROOT_PATH="$DEPS_PREFIX"
 
-Then:  ninja -C build-android sunshine
+Build the binary and the web UI:
+
+  cmake --build build-android --target sunshine
+  cmake --build build-android --target web-ui
+
+See scripts/android/README.md ("Deploying to a device") for the adb push + run steps.
 ==============================================================================
 EOF

@@ -53,6 +53,38 @@ into a separate `libcbs.a` and copies the internal headers. **This is the step m
 need a tweak** between FFmpeg versions — the script errors with guidance if the object names
 don't match the pinned tag.
 
+## Deploying to a device (rooted)
+
+The build produces a native executable, not an APK. On a rooted device you can push it and run
+it directly. The binary is built with `ANDROID_STL=c++_shared`, so `libc++_shared.so` must travel
+with it, and `CMAKE_INSTALL_PREFIX` sets where it expects config/assets (see `build-all.sh`).
+
+```bash
+NDK=/path/to/android-ndk-r26d
+ABI=x86_64                       # match your build
+DEVDIR=/data/local/tmp/sunshine  # = CMAKE_INSTALL_PREFIX
+LIBCXX=$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/$ABI-linux-android/libc++_shared.so
+
+adb shell "mkdir -p $DEVDIR/assets"
+adb push build-android/sunshine "$LIBCXX" "$DEVDIR/"      # binary + C++ runtime
+adb push build-android/assets/web "$DEVDIR/assets/"       # Web UI (served from assets/web)
+adb push src_assets/linux/assets/apps.json "$DEVDIR/apps.json"
+adb push src_assets/common/assets/*.png "$DEVDIR/assets/" # app box-art (optional, silences warnings)
+
+adb shell su -c "cd $DEVDIR && LD_LIBRARY_PATH=. ./sunshine"
+```
+
+Reach the Web UI at `https://<device-ip>:47990` (self-signed cert). Sunshine's CSRF protection
+only allowlists localhost by default, so to use the device's LAN IP add the origin to the config:
+
+```bash
+adb shell su -c 'echo "csrf_allowed_origins = https://<device-ip>:47990" >> /data/local/tmp/sunshine/sunshine.conf'
+```
+
+(Or tunnel instead: `adb forward tcp:47990 tcp:47990` and browse `https://localhost:47990`, which
+is allowlisted by default.) Moonlight pairing uses a separate PIN-based path (nvhttp) and is not
+affected by the CSRF setting.
+
 ## Known iteration points
 
 These scripts are execution-tested targets, not guaranteed one-shot builds. Expect to iterate on:
@@ -63,10 +95,16 @@ These scripts are execution-tested targets, not guaranteed one-shot builds. Expe
 3. **Option-name drift** — miniupnpc/opus/curl CMake option names change across releases; adjust
    the `-D` flags if a build ignores them.
 
-## Remaining work after the deps build
+## Current state
 
-Even once everything links and boots headless, the host does nothing useful until:
-- `src/platform/android/display.cpp` gets a real capture + a software (FFmpeg) encode device, and
-- `src/platform/android/input.cpp` drives `/dev/uinput` (rooted devices).
+Verified on a rooted Android 9 x86_64 device: the host **boots, serves its full Web UI, pairs
+Moonlight, and streams live software-encoded H.264** end to end. Software encode works via the
+base `avcodec_encode_device_t` (video.cpp substitutes its `avcodec_software_encode_device_t`).
 
-See the platform backend TODOs for the current state.
+What is still stubbed (streams succeed but with placeholder data):
+- **Screen capture** — `src/platform/android/display.cpp` emits black frames. This is the next
+  milestone: real capture (rooted SurfaceFlinger/`screencap`, or MediaProjection via the JNI
+  bridge). Until then Moonlight shows a black screen — expected, not a bug.
+- **Input injection** — `src/platform/android/input.cpp` is no-ops; drive `/dev/uinput` on rooted
+  devices.
+- **Audio** — `src/platform/android/audio.cpp` returns no controller; the stream has no audio.
