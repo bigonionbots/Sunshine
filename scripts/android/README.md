@@ -98,13 +98,21 @@ These scripts are execution-tested targets, not guaranteed one-shot builds. Expe
 ## Current state
 
 Verified on a rooted Android 9 x86_64 device: the host **boots, serves its full Web UI, pairs
-Moonlight, and streams live software-encoded H.264** end to end. Software encode works via the
-base `avcodec_encode_device_t` (video.cpp substitutes its `avcodec_software_encode_device_t`).
+Moonlight, streams the live screen as software-encoded H.264, and is controllable via mouse and
+keyboard** end to end.
 
-What is still stubbed (streams succeed but with placeholder data):
-- **Screen capture** — `src/platform/android/display.cpp` emits black frames. This is the next
-  milestone: real capture (rooted SurfaceFlinger/`screencap`, or MediaProjection via the JNI
-  bridge). Until then Moonlight shows a black screen — expected, not a bug.
-- **Input injection** — `src/platform/android/input.cpp` is no-ops; drive `/dev/uinput` on rooted
-  devices.
+Working:
+- **Software H.264 encode** — via the base `avcodec_encode_device_t` (video.cpp substitutes its
+  `avcodec_software_encode_device_t`).
+- **Screen capture** — `src/platform/android/display.cpp` grabs frames via the `screencap` tool.
+  PoC-grade: a process spawn per frame limits the frame rate, and colorspace/range is not yet
+  signaled. A native SurfaceComposerClient or MediaProjection + MediaCodec backend is the
+  performant successor.
+- **Mouse + keyboard input** — `src/platform/android/input.cpp` creates virtual `/dev/uinput`
+  devices (needs root + permissive SELinux for `/dev/uinput`). Absolute mouse is approximate on
+  the relative device; prefer Moonlight's relative mouse mode.
+
+Still stubbed:
 - **Audio** — `src/platform/android/audio.cpp` returns no controller; the stream has no audio.
+- **Touch, pen, gamepad** — `input.cpp` handlers are no-ops.
+- **Unicode/IME text entry** — only mapped keycodes are injected.
