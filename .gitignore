@@ -42,6 +42,13 @@ build/
 cmake-*/
 docs/doxyconfig*
 
+# Android cross-build outputs (scripts/android)
+build-android/
+android-deps/
+android-deps-build/
+ffmpeg-android/
+ffmpeg-android-build/
+
 # npm
 node_modules/
 

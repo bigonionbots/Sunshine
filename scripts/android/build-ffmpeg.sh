@@ -51,6 +51,20 @@ mkdir -p "$WORK" "$OUT/lib" "$OUT/include"
 export PKG_CONFIG_PATH="$OUT/lib/pkgconfig"
 export PKG_CONFIG_LIBDIR="$OUT/lib/pkgconfig"   # keep pkg-config off the host's libs
 
+# Assembly is enabled by default (nasm/yasm required). Set DISABLE_ASM=1 to build x264/x265
+# without hand-written assembly — no nasm needed, at a real encode-performance cost. Useful for
+# a bring-up spike on a host where installing nasm is inconvenient.
+if [ "${DISABLE_ASM:-0}" = "1" ]; then
+  X264_ASM_FLAG="--disable-asm"
+  X265_ASM_FLAG="-DENABLE_ASSEMBLY=OFF"
+  FFMPEG_ASM_FLAG="--disable-x86asm"
+  echo "==> DISABLE_ASM=1: building x264/x265/FFmpeg without assembly (slower encode)"
+else
+  X264_ASM_FLAG=""
+  X265_ASM_FLAG=""
+  FFMPEG_ASM_FLAG=""
+fi
+
 echo "==> ABI=$ABI  API=$API  triple=$TRIPLE  out=$OUT"
 
 # --- 1) x264 (static, PIC) -------------------------------------------------------------
@@ -66,6 +80,7 @@ make distclean >/dev/null 2>&1 || true
   --prefix="$OUT" \
   --enable-static --enable-pic \
   --disable-cli --disable-opencl \
+  ${X264_ASM_FLAG} \
   --cross-prefix="$TC/bin/llvm-"
 make -j"$JOBS"
 make install
@@ -82,9 +97,33 @@ cmake -G Ninja ../../source \
   -DANDROID_PLATFORM="android-$API" \
   -DCMAKE_INSTALL_PREFIX="$OUT" \
   -DENABLE_SHARED=OFF \
-  -DENABLE_CLI=OFF
+  -DENABLE_CLI=OFF \
+  ${X265_ASM_FLAG}
 ninja
 ninja install
+
+# x265's CMake omits x265.pc for static-only builds, so FFmpeg's pkg-config check for
+# --enable-libx265 fails. Generate it. libx265 is C++, so Libs.private carries the NDK C++
+# runtime (libc++_shared) — needed when FFmpeg link-tests x265 with the C compiler driver.
+if [ ! -f "$OUT/lib/pkgconfig/x265.pc" ]; then
+  x265_ver=$(sed -n 's/.*X265_VERSION[^0-9]*\([0-9.]\+\).*/\1/p' "$OUT/include/x265_config.h" 2>/dev/null | head -1)
+  : "${x265_ver:=3.6}"
+  mkdir -p "$OUT/lib/pkgconfig"
+  cat > "$OUT/lib/pkgconfig/x265.pc" <<PC
+prefix=$OUT
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: x265
+Description: H.265/HEVC video encoder
+Version: $x265_ver
+Libs: -L\${libdir} -lx265
+Libs.private: -lc++_shared -lm -ldl
+Cflags: -I\${includedir}
+PC
+  echo "==> generated x265.pc (version $x265_ver)"
+fi
 
 # --- 3) FFmpeg (static; libx264/libx265; CBS objects via *_metadata bitstream filters) --
 cd "$WORK"
@@ -104,12 +143,15 @@ make distclean >/dev/null 2>&1 || true
   --enable-static --disable-shared \
   --disable-programs --disable-doc \
   --disable-avdevice --disable-avformat --disable-network \
+  ${FFMPEG_ASM_FLAG} \
   --enable-libx264 --enable-libx265 \
   --enable-encoder=libx264,libx265 \
   --enable-parser=h264,hevc \
   --enable-bsf=h264_metadata,hevc_metadata,h264_mp4toannexb,hevc_mp4toannexb \
+  --pkg-config-flags="--static" \
   --extra-cflags="-I$OUT/include" \
-  --extra-ldflags="-L$OUT/lib"
+  --extra-ldflags="-L$OUT/lib" \
+  --extra-libs="-lc++_shared -lm -ldl"
 make -j"$JOBS"
 make install   # installs libavcodec/libswscale/libavutil + their public headers
 
@@ -131,11 +173,25 @@ if [ "${#CBS_OBJS[@]}" -eq 0 ]; then
 fi
 "$AR" rcs "$OUT/lib/libcbs.a" "${CBS_OBJS[@]}"
 
-mkdir -p "$OUT/include/libavcodec"
-for h in cbs cbs_h264 cbs_h265 cbs_h2645 cbs_sei h264_levels; do
-  if [ -f "libavcodec/$h.h" ]; then
-    cp "libavcodec/$h.h" "$OUT/include/libavcodec/"
-  fi
+# src/cbs.cpp pulls a deep closure of internal libavcodec/libavutil headers
+# (cbs_h264.h -> cbs_h2645.h -> h2645_parse.h -> get_bits.h -> mathops.h -> hevc/hevc.h -> ...),
+# none of which `make install` ships, spread across nested subdirs (x86/, hevc/, ...). Rather
+# than chase them one by one, copy both source header trees recursively (preserving structure).
+for lib in libavcodec libavutil; do
+  ( cd "$lib" && find . -name '*.h' -print0 | while IFS= read -r -d '' h; do
+      mkdir -p "$OUT/include/$lib/$(dirname "$h")"
+      cp "$h" "$OUT/include/$lib/$h"
+    done )
+done
+# FFmpeg's generated config headers live at the build root; internal headers include them
+# relatively (#include "config.h") from many subdirs. Drop a copy into every header directory.
+# Kept out of include/ root so they never shadow Sunshine's own "config.h" (resolved from the
+# source root via -I).
+for cfg in config.h config_components.h; do
+  [ -f "$cfg" ] || continue
+  for lib in libavcodec libavutil; do
+    find "$OUT/include/$lib" -type d -exec cp "$cfg" {} \;
+  done
 done
 
 echo
