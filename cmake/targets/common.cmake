@@ -18,6 +18,9 @@ elseif(UNIX)
 
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/targets/macos.cmake)
+    elseif(ANDROID)
+        # Android uses the NDK's libc++; the Linux target flags (-static-libgcc/-static-libstdc++)
+        # do not apply and would break the link.
     else()
         include(${CMAKE_MODULE_PATH}/targets/linux.cmake)
     endif()

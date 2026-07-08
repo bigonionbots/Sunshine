@@ -41,6 +41,9 @@ elseif(UNIX)
 
     if(APPLE)
         include(${CMAKE_MODULE_PATH}/packaging/macos.cmake)
+    elseif(ANDROID)
+        # No desktop packaging (.deb/.rpm/.desktop) for Android; the binary is installed by
+        # packaging/unix.cmake above and deployed via adb.
     else()
         include(${CMAKE_MODULE_PATH}/packaging/linux.cmake)
     endif()

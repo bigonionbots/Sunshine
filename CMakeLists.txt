@@ -41,6 +41,15 @@ set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 # export compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Android (NDK r26) libc++ gates <format> and other newer C++ library features behind the
+# experimental library. Sunshine and some subprojects (e.g. libdisplaydevice) use std::format,
+# so enable it globally here — before any add_subdirectory() so every dependency inherits it.
+# Needed at both compile (header) and link (libc++experimental) time.
+if(ANDROID)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
+    add_link_options(-fexperimental-library)
+endif()
+
 # set version info for this build
 include(${CMAKE_MODULE_PATH}/prep/build_version.cmake)
 

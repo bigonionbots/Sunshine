@@ -171,6 +171,13 @@ else()
     if(EXISTS "${FFMPEG_PREPARED_BINARIES}/lib/libhdr10plus.a")
         list(APPEND FFMPEG_LIBRARIES "${FFMPEG_PREPARED_BINARIES}/lib/libhdr10plus.a")
     endif()
+    # libavcodec may reference libswresample (e.g. its opus decoder) depending on how FFmpeg was
+    # configured. LizardByte's prebuilts strip such decoders; a from-source build (e.g. the
+    # Android recipe) may include them, so link swresample when present. Appended last so
+    # libavcodec's swr_* references resolve against it.
+    if(EXISTS "${FFMPEG_PREPARED_BINARIES}/lib/libswresample.a")
+        list(APPEND FFMPEG_LIBRARIES "${FFMPEG_PREPARED_BINARIES}/lib/libswresample.a")
+    endif()
 
     # Add platform libraries
     list(APPEND FFMPEG_LIBRARIES ${FFMPEG_PLATFORM_LIBRARIES})
