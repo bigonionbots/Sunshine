@@ -1,14 +1,14 @@
 /**
  * @file src/platform/android/display.cpp
  * @brief Android screen-capture backend.
- * @details Proof-of-concept capture backed by the Android `screencap` tool (SurfaceFlinger
- *          screenshot). Each frame is grabbed by running `screencap`, parsing its raw
- *          {width,height,format[,dataspace]} header, and copying the RGBA_8888 pixels into a
- *          system-memory image (swapping R/B to the AV_PIX_FMT_BGR0 the software encoder expects).
- *          It is simple and rooted-friendly but slow (a process spawn per frame), so it is a
- *          stepping stone toward a real backend (native SurfaceComposerClient, or MediaProjection
- *          via the JNI bridge, feeding a MediaCodec encode device). On any failure it falls back
- *          to black frames so the streaming session keeps running.
+ * @details Prefers direct Linux framebuffer capture (`/dev/graphics/fb0`): the framebuffer is
+ *          mmap'd once and each frame is a cheap memory copy (converting to the AV_PIX_FMT_BGR0
+ *          the software encoder expects, with R/B order detected at runtime from the fb bitfields).
+ *          This is fast and persistent — no per-frame process spawn — and works on software-
+ *          rendered android-x86 VMs where fb0 holds the live screen. On devices where fb0 is
+ *          unavailable or blank (e.g. hardware-composited phones), it falls back to the `screencap`
+ *          tool. Any failure emits black so the streaming session keeps running. The performant
+ *          successor remains MediaProjection + a MediaCodec encode device via the JNI bridge.
  */
 // standard includes
 #include <chrono>
@@ -17,6 +17,13 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+
+// platform includes
+#include <fcntl.h>
+#include <linux/fb.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // local includes
 #include "src/platform/android/jni_bridge.h"
@@ -30,6 +37,8 @@ namespace platf {
   namespace {
     constexpr int BYTES_PER_PIXEL = 4;  ///< Bytes per pixel for the 32-bpp capture buffer.
     constexpr auto SCREENCAP_PATH = "/system/bin/screencap";  ///< Path to the Android screencap tool.
+    constexpr auto FRAMEBUFFER_PATH = "/dev/graphics/fb0";  ///< Path to the Linux framebuffer device.
+    constexpr auto TARGET_FRAME_INTERVAL = 16667us;  ///< Capture pacing floor (~60 fps).
 
     /**
      * @brief Parsed screencap raw header.
@@ -64,8 +73,8 @@ namespace platf {
     /**
      * @brief Parse a screencap raw header.
      * @details The header is {width, height, format} as uint32, optionally followed by a
-     *          dataspace uint32 on newer Android, then tightly-packed 32-bit pixels. The optional
-     *          field (and thus a 12- or 16-byte header) is detected by matching the total size.
+     *          dataspace uint32 on newer Android, then tightly-packed 32-bit pixels. Both 12- and
+     *          16-byte headers are handled by matching the total size.
      *
      * @param raw Raw screencap output.
      * @param hdr Populated with the parsed dimensions and pixel offset on success.
@@ -104,44 +113,117 @@ namespace platf {
   };
 
   /**
-   * @brief Android display backend that captures the screen via the `screencap` tool.
+   * @brief Android display backend: framebuffer capture with a screencap fallback.
    */
   struct android_display_t: display_t {
+    // Framebuffer capture state.
+    int fb_fd {-1};  ///< File descriptor for the framebuffer device, or -1 if unused.
+    std::uint8_t *fb_mem {nullptr};  ///< mmap'd framebuffer memory, or nullptr.
+    std::size_t fb_size {0};  ///< Size of the mmap'd framebuffer region.
+    int fb_stride {0};  ///< Framebuffer row length in bytes.
+    bool fb_swap_rb {false};  ///< Whether the framebuffer stores red in the low byte (RGB -> needs swap).
+    bool use_framebuffer {false};  ///< True when framebuffer capture is active.
+
+    // screencap fallback state.
     std::vector<std::uint8_t> capture_buf;  ///< Reused buffer for raw screencap output.
 
-    /**
-     * @brief Capture loop that grabs screen frames until interrupted.
-     *
-     * @param push_captured_image_cb Callback invoked with each captured image.
-     * @param pull_free_image_cb Callback used to obtain a free image from the pool.
-     * @param cursor Unused; whether the cursor should be captured.
-     * @return Capture status when the loop exits.
-     */
-    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
-      while (true) {
-        std::shared_ptr<img_t> img;
-        if (!pull_free_image_cb(img)) {
-          return capture_e::ok;  // capture interrupted
-        }
-
-        if (!grab_screen(img.get())) {
-          dummy_img(img.get());  // fall back to black on any capture failure
-        }
-
-        if (!push_captured_image_cb(std::move(img), true)) {
-          return capture_e::ok;  // break requested
-        }
-
-        // Light floor; the screencap process latency dominates the effective frame rate.
-        std::this_thread::sleep_for(8ms);
+    ~android_display_t() override {
+      if (fb_mem && fb_mem != MAP_FAILED) {
+        munmap(fb_mem, fb_size);
+      }
+      if (fb_fd >= 0) {
+        close(fb_fd);
       }
     }
 
     /**
-     * @brief Grab one screen frame into the image via `screencap`.
+     * @brief Try to open and mmap the Linux framebuffer for capture.
+     *
+     * @return True when the framebuffer is available as a 32-bpp source.
+     */
+    bool init_framebuffer() {
+      fb_fd = open(FRAMEBUFFER_PATH, O_RDONLY);
+      if (fb_fd < 0) {
+        return false;
+      }
+      fb_var_screeninfo var {};
+      fb_fix_screeninfo fix {};
+      if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0 || ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) < 0 || var.bits_per_pixel != 32) {
+        close(fb_fd);
+        fb_fd = -1;
+        return false;
+      }
+      fb_stride = static_cast<int>(fix.line_length);
+      fb_size = fix.smem_len ? fix.smem_len : static_cast<std::size_t>(fb_stride) * var.yres_virtual;
+      fb_mem = static_cast<std::uint8_t *>(mmap(nullptr, fb_size, PROT_READ, MAP_SHARED, fb_fd, 0));
+      if (fb_mem == MAP_FAILED) {
+        fb_mem = nullptr;
+        close(fb_fd);
+        fb_fd = -1;
+        return false;
+      }
+      width = static_cast<int>(var.xres);
+      height = static_cast<int>(var.yres);
+      // BGR0 wants blue in the low byte; swap when red is lower (RGBA/RGBX framebuffers).
+      fb_swap_rb = var.red.offset < var.blue.offset;
+      use_framebuffer = true;
+      BOOST_LOG(info) << "android: framebuffer capture "sv << width << "x"sv << height
+                      << " stride="sv << fb_stride << " swap_rb="sv << fb_swap_rb;
+      return true;
+    }
+
+    /**
+     * @brief Copy the current framebuffer contents into the image (converted to BGR0).
+     *
+     * @param img Destination image (must match the display dimensions).
+     * @return True on success.
+     */
+    bool grab_framebuffer(img_t *img) {
+      if (fb_fd < 0 || !fb_mem || !img || !img->data) {
+        return false;
+      }
+      // Follow the currently-visible buffer for panned/double-buffered framebuffers.
+      std::size_t src_off = 0;
+      fb_var_screeninfo var {};
+      if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) == 0) {
+        src_off = static_cast<std::size_t>(var.yoffset) * fb_stride;
+      }
+      if (src_off + static_cast<std::size_t>(fb_stride) * height > fb_size) {
+        src_off = 0;  // guard against an out-of-range offset
+      }
+
+      const std::uint8_t *src = fb_mem + src_off;
+      std::uint8_t *dst = img->data;
+      if (!fb_swap_rb && fb_stride == img->row_pitch) {
+        std::memcpy(dst, src, static_cast<std::size_t>(img->row_pitch) * height);
+        return true;
+      }
+      for (int y = 0; y < height; ++y) {
+        const std::uint8_t *s = src + static_cast<std::size_t>(y) * fb_stride;
+        std::uint8_t *d = dst + static_cast<std::size_t>(y) * img->row_pitch;
+        for (int x = 0; x < width; ++x) {
+          if (fb_swap_rb) {
+            d[0] = s[2];  // B
+            d[1] = s[1];  // G
+            d[2] = s[0];  // R
+          } else {
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+          }
+          d[3] = 0;  // X
+          s += 4;
+          d += 4;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Grab one screen frame via the `screencap` tool (fallback path).
      *
      * @param img Destination image (must match the negotiated display dimensions).
-     * @return True on a successful capture and conversion; false on any failure.
+     * @return True on a successful capture and conversion.
      */
     bool grab_screen(img_t *img) {
       if (!img || !img->data) {
@@ -155,15 +237,12 @@ namespace platf {
         return false;
       }
       if (static_cast<int>(hdr.width) != img->width || static_cast<int>(hdr.height) != img->height) {
-        // Resolution changed since session negotiation; skip rather than corrupt the frame.
         return false;
       }
-
       const std::uint8_t *src = capture_buf.data() + hdr.pixel_offset;
       std::uint8_t *dst = img->data;
       const std::size_t px = static_cast<std::size_t>(hdr.width) * hdr.height;
-      // screencap yields RGBA_8888 (R,G,B,A); the software encoder reads AV_PIX_FMT_BGR0
-      // (B,G,R,X). Swap R and B while copying. (If red/blue look swapped, drop the swap.)
+      // screencap yields RGBA_8888; convert to AV_PIX_FMT_BGR0 (swap R/B).
       for (std::size_t i = 0; i < px; ++i) {
         dst[i * 4 + 0] = src[i * 4 + 2];  // B
         dst[i * 4 + 1] = src[i * 4 + 1];  // G
@@ -171,6 +250,32 @@ namespace platf {
         dst[i * 4 + 3] = 0;  // X
       }
       return true;
+    }
+
+    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      while (true) {
+        auto frame_start = std::chrono::steady_clock::now();
+
+        std::shared_ptr<img_t> img;
+        if (!pull_free_image_cb(img)) {
+          return capture_e::ok;  // capture interrupted
+        }
+
+        bool ok = use_framebuffer ? grab_framebuffer(img.get()) : grab_screen(img.get());
+        if (!ok) {
+          dummy_img(img.get());  // fall back to black on any capture failure
+        }
+
+        if (!push_captured_image_cb(std::move(img), true)) {
+          return capture_e::ok;  // break requested
+        }
+
+        // Pace to the target frame interval; the encoder's image pool also applies backpressure.
+        auto elapsed = std::chrono::steady_clock::now() - frame_start;
+        if (elapsed < TARGET_FRAME_INTERVAL) {
+          std::this_thread::sleep_for(TARGET_FRAME_INTERVAL - elapsed);
+        }
+      }
     }
 
     std::shared_ptr<img_t> alloc_img() override {
@@ -196,41 +301,40 @@ namespace platf {
       // Software encode path: return the base device (data == nullptr). video.cpp detects this
       // and substitutes its own avcodec_software_encode_device_t, which performs the CPU
       // pixel-format conversion (sws_scale) from our system-memory frames into the x264/x265
-      // encoder. This mirrors the software branch of the Linux x11grab backend. A MediaCodec-
-      // backed hardware device would be returned here in the future.
+      // encoder. A MediaCodec-backed hardware device would be returned here in the future.
       return std::make_unique<avcodec_encode_device_t>();
     }
   };
 
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
-    auto metrics = jni::display_metrics();
-    int w = metrics.width;
-    int h = metrics.height;
+    auto disp = std::make_shared<android_display_t>();
 
-    // Probe the real screen size via screencap so the encoder frame size matches the device.
-    {
+    // Prefer the direct framebuffer (fast, persistent). Fall back to screencap.
+    if (!disp->init_framebuffer()) {
+      auto metrics = jni::display_metrics();
+      int w = metrics.width;
+      int h = metrics.height;
       std::vector<std::uint8_t> raw;
       screencap_header_t hdr;
       if (run_screencap(raw) && parse_screencap(raw, hdr)) {
         w = static_cast<int>(hdr.width);
         h = static_cast<int>(hdr.height);
-        BOOST_LOG(info) << "android: screencap available, capturing "sv << w << "x"sv << h;
+        BOOST_LOG(info) << "android: framebuffer unavailable, using screencap capture "sv << w << "x"sv << h;
       } else {
-        BOOST_LOG(warning) << "android: screencap probe failed; frames will be black ("sv << w << "x"sv << h << ")"sv;
+        BOOST_LOG(warning) << "android: no framebuffer or screencap; frames will be black ("sv << w << "x"sv << h << ")"sv;
       }
+      disp->width = w;
+      disp->height = h;
     }
 
-    auto disp = std::make_shared<android_display_t>();
-    disp->width = w;
-    disp->height = h;
     disp->offset_x = 0;
     disp->offset_y = 0;
-    disp->env_width = w;
-    disp->env_height = h;
-    disp->env_logical_width = w;
-    disp->env_logical_height = h;
-    disp->logical_width = w;
-    disp->logical_height = h;
+    disp->env_width = disp->width;
+    disp->env_height = disp->height;
+    disp->env_logical_width = disp->width;
+    disp->env_logical_height = disp->height;
+    disp->logical_width = disp->width;
+    disp->logical_height = disp->height;
     return disp;
   }
 
