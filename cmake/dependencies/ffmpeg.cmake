@@ -141,6 +141,10 @@ else()
             set(FFMPEG_PLATFORM_LIBRARIES mfplat ole32 strmiids mfuuid vpl)
         elseif(FREEBSD)
             set(FFMPEG_PLATFORM_LIBRARIES va va-drm va-x11 X11)
+        elseif(ANDROID)
+            # Android has none of the desktop VA-API/X11/numa stack; the NDK sysroot provides
+            # any FFmpeg system deps directly, so no extra platform libraries are needed.
+            set(FFMPEG_PLATFORM_LIBRARIES "")
         elseif(UNIX AND NOT APPLE)
             set(FFMPEG_PLATFORM_LIBRARIES numa va va-drm va-x11 X11)
         endif()

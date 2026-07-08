@@ -42,6 +42,11 @@ endif()
 if(APPLE)
     option(SUNSHINE_CONFIGURE_PORTFILE
             "Configure macOS Portfile. Recommended to use with SUNSHINE_CONFIGURE_ONLY" OFF)
+elseif(ANDROID)
+    # Android is a UNIX (non-Apple) target but has none of the desktop capture/encode/tray
+    # stack. Skip the Linux capture options entirely and force the tray off so the desktop
+    # code paths are never pulled into the build.
+    set(SUNSHINE_ENABLE_TRAY OFF CACHE BOOL "Enable system tray icon." FORCE)
 elseif(UNIX)  # Linux
     option(SUNSHINE_BUILD_APPIMAGE
             "Enable an AppImage build." OFF)

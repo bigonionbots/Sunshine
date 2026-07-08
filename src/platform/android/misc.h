@@ -1,0 +1,24 @@
+/**
+ * @file src/platform/android/misc.h
+ * @brief Declarations for miscellaneous Android platform helpers shared within the backend.
+ */
+#pragma once
+
+// standard includes
+#include <string>
+
+// local includes
+#include "src/platform/common.h"
+
+namespace platf {
+  /**
+   * @brief Owning wrapper for the Android platform input backend.
+   * @details Allocated by `platf::input()` and released by `platf::freeInput()`.
+   *          On rooted devices this owns the `/dev/uinput` virtual device handles.
+   */
+  struct android_input_t {
+    int uinput_mouse_fd {-1};  ///< File descriptor for the virtual mouse uinput device, or -1 if unavailable.
+    int uinput_keyboard_fd {-1};  ///< File descriptor for the virtual keyboard uinput device, or -1 if unavailable.
+    int uinput_touch_fd {-1};  ///< File descriptor for the virtual touchscreen uinput device, or -1 if unavailable.
+  };
+}  // namespace platf
