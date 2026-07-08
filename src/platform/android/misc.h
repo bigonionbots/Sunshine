@@ -20,5 +20,7 @@ namespace platf {
     int uinput_mouse_fd {-1};  ///< File descriptor for the virtual mouse uinput device, or -1 if unavailable.
     int uinput_keyboard_fd {-1};  ///< File descriptor for the virtual keyboard uinput device, or -1 if unavailable.
     int uinput_touch_fd {-1};  ///< File descriptor for the virtual touchscreen uinput device, or -1 if unavailable.
+    double abs_x {0};  ///< Tracked virtual cursor X, used to turn absolute moves into relative deltas.
+    double abs_y {0};  ///< Tracked virtual cursor Y, used to turn absolute moves into relative deltas.
   };
 }  // namespace platf
