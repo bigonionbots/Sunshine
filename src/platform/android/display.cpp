@@ -83,10 +83,12 @@ namespace platf {
     }
 
     std::unique_ptr<avcodec_encode_device_t> make_avcodec_encode_device(pix_fmt_e pix_fmt) override {
-      // TODO: first milestone — wire an FFmpeg software (x264/x265) encode device here so the
-      // placeholder frames actually encode and stream. MediaCodec is the performant follow-up.
-      BOOST_LOG(warning) << "android: make_avcodec_encode_device not yet implemented"sv;
-      return nullptr;
+      // Software encode path: return the base device (data == nullptr). video.cpp detects this
+      // and substitutes its own avcodec_software_encode_device_t, which performs the CPU
+      // pixel-format conversion (sws_scale) from our system-memory frames into the x264/x265
+      // encoder. This mirrors the software branch of the Linux x11grab backend. A MediaCodec-
+      // backed hardware device would be returned here in the future.
+      return std::make_unique<avcodec_encode_device_t>();
     }
   };
 
