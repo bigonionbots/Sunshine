@@ -67,8 +67,20 @@ class SunshineService : Service() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bridge = IInputBridge.Stub.asInterface(binder)
             inputBridge = bridge
+            // Register the bridge for the injectInputEvent fallback path.
             SunshineNative.nativeSetInputBridge(bridge)
-            Log.i(TAG, "Shizuku input bridge connected")
+            // Ask the shell-privileged service to open uinput devices and hand us the fds. This
+            // registers real pointer devices with the kernel, making the mouse cursor visible.
+            try {
+                val mousePfd = bridge.openUinputMouse()
+                val kbPfd = bridge.openUinputKeyboard()
+                val mouseFd = mousePfd?.detachFd() ?: -1
+                val kbFd = kbPfd?.detachFd() ?: -1
+                SunshineNative.nativeSetUinputFds(mouseFd, kbFd)
+                Log.i(TAG, "Shizuku input bridge connected; uinput fds: mouse=$mouseFd kb=$kbFd")
+            } catch (e: Exception) {
+                Log.e(TAG, "openUinput from Shizuku failed; falling back to event injection", e)
+            }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
             inputBridge = null

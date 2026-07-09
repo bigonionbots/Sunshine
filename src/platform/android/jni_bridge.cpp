@@ -32,6 +32,8 @@ namespace jni {
     std::atomic<int> g_capture_w {0};  ///< Advertised capture width.
     std::atomic<int> g_capture_h {0};  ///< Advertised capture height.
 
+    int g_uinput_mouse_fd {-1};  ///< Mouse uinput fd provided by the Shizuku UserService, or -1.
+    int g_uinput_keyboard_fd {-1};  ///< Keyboard uinput fd provided by the Shizuku UserService, or -1.
     input_callbacks_t g_input_cb;  ///< App-side Shizuku input callbacks (empty when headless).
     video_callbacks_t g_video_cb;  ///< App-side MediaCodec callbacks (empty when headless).
     std::atomic<bool> g_video_active {false};  ///< Whether MediaCodec surface encode is running.
@@ -225,6 +227,20 @@ namespace jni {
       }
     }
     return true;
+  }
+
+  void set_uinput_fds(int mouse_fd, int keyboard_fd) {
+    if (mouse_fd >= 0) {
+      g_uinput_mouse_fd = mouse_fd;
+    }
+    if (keyboard_fd >= 0) {
+      g_uinput_keyboard_fd = keyboard_fd;
+    }
+  }
+
+  void get_uinput_fds(int &mouse_fd, int &keyboard_fd) {
+    mouse_fd = g_uinput_mouse_fd;
+    keyboard_fd = g_uinput_keyboard_fd;
   }
 
   void set_input_callbacks(input_callbacks_t callbacks) {

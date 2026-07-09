@@ -5,21 +5,16 @@
 package dev.lizardbyte.sunshine;
 
 interface IInputBridge {
-    /** Key press/release. vkCode is the Windows virtual-key code Moonlight sends. */
-    void injectKey(int vkCode, boolean pressed);
-
-    /** Relative mouse movement in raw screen pixels. */
-    void injectMouseMove(float dx, float dy);
+    /**
+     * Open and configure a uinput virtual mouse device (as the shell user). Returns an open fd
+     * that the app can pass directly to the native write() calls, giving the cursor visibility.
+     * Returns null when /dev/uinput is inaccessible.
+     */
+    ParcelFileDescriptor openUinputMouse();
 
     /**
-     * Mouse button press/release.
-     * button: 1=left  2=right  4=middle  8=X1  16=X2  (matches Sunshine's BUTTON_* enum).
+     * Open and configure a uinput virtual keyboard device (as the shell user).
+     * Returns null when /dev/uinput is inaccessible.
      */
-    void injectMouseButton(int button, boolean pressed);
-
-    /** Vertical scroll, high-resolution 1/120-wheel-notch units (positive = up). */
-    void injectScroll(int distance);
-
-    /** Horizontal scroll, same units as injectScroll. */
-    void injectHScroll(int distance);
+    ParcelFileDescriptor openUinputKeyboard();
 }

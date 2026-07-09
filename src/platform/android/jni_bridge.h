@@ -264,6 +264,28 @@ namespace jni {
    */
   bool video_output_wait(int timeout_ms);
 
+  // --- Shizuku uinput fd handoff -----------------------------------------------------------
+  //
+  // The Shizuku UserService (shell) creates and configures uinput devices, then passes the open
+  // fds to the app over Binder. These are stored here and picked up by the input backend.
+
+  /**
+   * @brief Store uinput fds received from the Shizuku UserService.
+   * @details Called from jni_main after nativeSetUinputFds(). Negative values are ignored.
+   *
+   * @param mouse_fd Open mouse uinput fd, or -1.
+   * @param keyboard_fd Open keyboard uinput fd, or -1.
+   */
+  void set_uinput_fds(int mouse_fd, int keyboard_fd);
+
+  /**
+   * @brief Retrieve the uinput fds stored by set_uinput_fds().
+   *
+   * @param mouse_fd Populated with the mouse fd, or -1 if unset.
+   * @param keyboard_fd Populated with the keyboard fd, or -1 if unset.
+   */
+  void get_uinput_fds(int &mouse_fd, int &keyboard_fd);
+
   // --- Shizuku / non-root input injection --------------------------------------------------
   //
   // When /dev/uinput is unavailable (no root), the app connects to a Shizuku UserService running

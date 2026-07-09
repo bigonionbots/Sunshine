@@ -16,6 +16,7 @@
 
 // local includes
 #include "src/platform/android/jni_bridge.h"
+#include "src/platform/android/misc.h"
 
 /**
  * @brief Sunshine's entry point, compiled into the shared library.
@@ -154,6 +155,39 @@ extern "C" {
     if (samples) {
       jni::push_audio(samples, count);
     }
+  }
+
+  /**
+   * @brief Create a uinput virtual mouse device (called from the shell-privileged Shizuku UserService).
+   * @details Opens /dev/uinput and configures it as a relative-axis mouse. The fd is returned to
+   *          the UserService, wrapped in a ParcelFileDescriptor, and passed back to the app over
+   *          Binder, giving the native input layer a legitimately-opened fd without needing root.
+   *
+   * @return Open uinput fd on success, or -1 on failure.
+   */
+  JNIEXPORT jint JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeCreateUinputMouse(JNIEnv *, jclass) {
+    return platf::android_create_uinput_mouse();
+  }
+
+  /**
+   * @brief Create a uinput virtual keyboard device (called from the shell-privileged Shizuku UserService).
+   *
+   * @return Open uinput fd on success, or -1 on failure.
+   */
+  JNIEXPORT jint JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeCreateUinputKeyboard(JNIEnv *, jclass) {
+    return platf::android_create_uinput_keyboard();
+  }
+
+  /**
+   * @brief Hand pre-opened uinput fds (received from the Shizuku UserService) to the input layer.
+   * @details After the UserService returns the fds via Binder, the app extracts the native int fds
+   *          and calls this to make them available to the streaming input handler.
+   *
+   * @param mouse_fd Open mouse uinput fd, or -1.
+   * @param keyboard_fd Open keyboard uinput fd, or -1.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeSetUinputFds(JNIEnv *, jclass, jint mouse_fd, jint keyboard_fd) {
+    jni::set_uinput_fds(mouse_fd, keyboard_fd);
   }
 
   /**
