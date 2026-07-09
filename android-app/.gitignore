@@ -1,0 +1,12 @@
+# Gradle / build outputs
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# Prebuilt artifacts staged by the native build (not source; see scripts/android):
+#   - libsunshine.so / libc++_shared.so  (from the CMake/NDK build)
+#   - web UI + apps.json                 (from the web-ui build / src_assets)
+app/src/main/jniLibs/
+app/src/main/assets/
