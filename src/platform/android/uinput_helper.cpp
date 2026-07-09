@@ -105,9 +105,12 @@ extern "C" {
     }
     uinput_user_dev uud {};
     std::snprintf(uud.name, UINPUT_MAX_NAME_SIZE, "Sunshine Gamepad %d", static_cast<int>(slot));
+    // Microsoft Xbox One controller VID/PID. Android ships a keylayout for this device
+    // (Vendor_045e_Product_02dd.kl) that maps BTN_SOUTH→BUTTON_A etc., and Chrome applies
+    // the Xbox standard-gamepad mapping so RS lands at axes[2]/[3] and triggers as buttons.
     uud.id.bustype = BUS_USB;
-    uud.id.vendor = 0x1209;
-    uud.id.product = static_cast<uint16_t>(0x0010 + slot);
+    uud.id.vendor = 0x045E;
+    uud.id.product = static_cast<uint16_t>(0x02DD + slot);
     uud.id.version = 1;
     // Dual sticks: ±32767
     for (int a : {ABS_X, ABS_Y, ABS_RX, ABS_RY}) {

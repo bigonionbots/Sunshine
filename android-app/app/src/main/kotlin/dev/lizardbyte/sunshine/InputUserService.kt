@@ -183,11 +183,12 @@ class InputUserService : IInputBridge.Stub() {
         val fd = gamepadFds.getOrElse(slot) { -1 }
         if (fd < 0) return
 
-        // Sticks (±32767) — Android ABS_Y: up = negative, same as Linux convention
-        ev(fd, EV_ABS, ABS_X,  (lsX * 32767).toInt())
-        ev(fd, EV_ABS, ABS_Y,  (lsY * 32767).toInt())
-        ev(fd, EV_ABS, ABS_RX, (rsX * 32767).toInt())
-        ev(fd, EV_ABS, ABS_RY, (rsY * 32767).toInt())
+        // Sticks (±32767). Moonlight sends Y with up=+32767 (Windows/XInput convention),
+        // but Linux ABS_Y expects up=negative. Negate Y on both sticks (mirrors inputtino).
+        ev(fd, EV_ABS, ABS_X,   (lsX * 32767).toInt())
+        ev(fd, EV_ABS, ABS_Y,  -(lsY * 32767).toInt())
+        ev(fd, EV_ABS, ABS_RX,  (rsX * 32767).toInt())
+        ev(fd, EV_ABS, ABS_RY, -(rsY * 32767).toInt())
 
         // Triggers (0–255)
         ev(fd, EV_ABS, ABS_Z,  (lt * 255).toInt())
