@@ -295,6 +295,22 @@ namespace platf {
       sleep_overshoot_logger.reset();
 
       while (true) {
+        // MediaCodec surface encode: the VirtualDisplay renders straight into the encoder, so no
+        // pixels reach this process. Pace one dummy tick per encoded access unit so the encode loop
+        // runs 1:1 with codec output (the encoder session ignores the tick's pixel contents).
+        if (jni::video_encoder_active()) {
+          jni::video_output_wait(200);
+          std::shared_ptr<img_t> img;
+          if (!pull_free_image_cb(img)) {
+            return capture_e::ok;
+          }
+          dummy_img(img.get());
+          if (!push_captured_image_cb(std::move(img), true)) {
+            return capture_e::ok;
+          }
+          continue;
+        }
+
         auto now = std::chrono::steady_clock::now();
         if (next_frame > now) {
           std::this_thread::sleep_for(next_frame - now);

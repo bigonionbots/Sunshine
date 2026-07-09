@@ -32,6 +32,25 @@ namespace jni {
     std::atomic<int> g_capture_w {0};  ///< Advertised capture width.
     std::atomic<int> g_capture_h {0};  ///< Advertised capture height.
 
+    video_callbacks_t g_video_cb;  ///< App-side MediaCodec callbacks (empty when headless).
+    std::atomic<bool> g_video_active {false};  ///< Whether MediaCodec surface encode is running.
+
+    std::mutex g_encoded_mutex;  ///< Guards the encoded access-unit queue.
+    std::condition_variable g_encoded_cv;  ///< Signals newly pushed access units.
+
+    /**
+     * @brief One encoded access unit awaiting transmission.
+     */
+    struct encoded_au_t {
+      std::vector<std::uint8_t> data;  ///< Access-unit bytes.
+      bool idr {false};  ///< Whether this is a keyframe.
+    };
+
+    std::deque<encoded_au_t> g_encoded;  ///< Encoded access units from MediaCodec.
+
+    /// Cap the encoded backlog; if the pipeline stalls, keep only the most recent frames.
+    constexpr std::size_t k_encoded_max = 8;
+
     std::mutex g_audio_mutex;  ///< Guards the audio ring buffer and format.
     std::condition_variable g_audio_cv;  ///< Signals newly pushed audio samples.
     std::deque<float> g_audio_buf;  ///< Interleaved float PCM awaiting consumption.
@@ -205,6 +224,102 @@ namespace jni {
       }
     }
     return true;
+  }
+
+  void set_video_callbacks(video_callbacks_t callbacks) {
+    g_video_cb = std::move(callbacks);
+  }
+
+  bool video_encoder_available() {
+    return static_cast<bool>(g_video_cb.start);
+  }
+
+  bool video_encoder_start(int width, int height, int codec, int fps, int bitrate_bps) {
+    if (!g_video_cb.start) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(g_encoded_mutex);
+      g_encoded.clear();
+    }
+    if (!g_video_cb.start(width, height, codec, fps, bitrate_bps)) {
+      return false;
+    }
+    g_video_active = true;
+    return true;
+  }
+
+  void video_encoder_stop() {
+    g_video_active = false;
+    if (g_video_cb.stop) {
+      g_video_cb.stop();
+    }
+    std::lock_guard<std::mutex> lock(g_encoded_mutex);
+    g_encoded.clear();
+    g_encoded_cv.notify_all();
+  }
+
+  bool video_encoder_active() {
+    return g_video_active.load();
+  }
+
+  void video_request_keyframe() {
+    if (g_video_cb.request_keyframe) {
+      g_video_cb.request_keyframe();
+    }
+  }
+
+  void video_set_bitrate(int bitrate_bps) {
+    if (g_video_cb.set_bitrate) {
+      g_video_cb.set_bitrate(bitrate_bps);
+    }
+  }
+
+  void push_encoded(const std::uint8_t *data, int size, int flags, std::int64_t pts_us) {
+    (void) pts_us;
+    if (!data || size <= 0) {
+      return;
+    }
+    // Drop standalone codec-config (SPS/PPS/VPS) buffers: MediaCodec is configured to prepend
+    // headers to each sync frame, so these are redundant.
+    constexpr int flag_keyframe = 0x1;
+    constexpr int flag_codec_config = 0x2;
+    if (flags & flag_codec_config) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_encoded_mutex);
+    if (!g_video_active) {
+      return;
+    }
+    if (g_encoded.size() >= k_encoded_max) {
+      g_encoded.pop_front();  // pipeline stalled; keep the freshest frames
+    }
+    encoded_au_t au;
+    au.data.assign(data, data + size);
+    au.idr = (flags & flag_keyframe) != 0;
+    g_encoded.push_back(std::move(au));
+    g_encoded_cv.notify_one();
+  }
+
+  bool pull_encoded(std::vector<std::uint8_t> &out, bool &is_idr, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(g_encoded_mutex);
+    const bool have = g_encoded_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+      return !g_encoded.empty() || !g_video_active;
+    });
+    if (!have || g_encoded.empty()) {
+      return false;
+    }
+    out = std::move(g_encoded.front().data);
+    is_idr = g_encoded.front().idr;
+    g_encoded.pop_front();
+    return true;
+  }
+
+  bool video_output_wait(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(g_encoded_mutex);
+    return g_encoded_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+      return !g_encoded.empty() || !g_video_active;
+    }) && !g_encoded.empty();
   }
 
 }  // namespace jni

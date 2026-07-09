@@ -12,8 +12,10 @@
 
 // standard includes
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace jni {
   /**
@@ -162,4 +164,103 @@ namespace jni {
    * @return True when real captured audio was written, false when silence was written.
    */
   bool read_audio(float *dst, int frames, int out_channels, int timeout_ms);
+
+  // --- MediaCodec hardware video encode -----------------------------------------------------
+  //
+  // The app renders the capture VirtualDisplay straight into a MediaCodec input Surface, so
+  // encoded H.264/HEVC access units flow back over this bridge with no CPU frame copy. The
+  // native encoder session drives start/stop/keyframe/bitrate through app-provided callbacks
+  // and drains encoded access units from a bounded queue.
+
+  /**
+   * @brief App-side callbacks that drive the MediaCodec encoder.
+   * @details Registered by the host app (via jni_main). Empty when running headless, in which
+   *          case the MediaCodec encode path is unavailable and Sunshine falls back to software.
+   */
+  struct video_callbacks_t {
+    std::function<bool(int width, int height, int codec, int fps, int bitrate_bps)> start;  ///< (Re)start MediaCodec and point the VirtualDisplay at its input surface.
+    std::function<void()> stop;  ///< Stop MediaCodec and restore the preview capture.
+    std::function<void()> request_keyframe;  ///< Ask MediaCodec for a sync (IDR) frame.
+    std::function<void(int bitrate_bps)> set_bitrate;  ///< Adjust the target bitrate.
+  };
+
+  /**
+   * @brief Register the app-side MediaCodec callbacks.
+   *
+   * @param callbacks Callback set, or a default-constructed value to clear.
+   */
+  void set_video_callbacks(video_callbacks_t callbacks);
+
+  /**
+   * @brief Whether the app registered MediaCodec callbacks (i.e. hardware encode is possible).
+   *
+   * @return True when a host app can service MediaCodec encode.
+   */
+  bool video_encoder_available();
+
+  /**
+   * @brief Start MediaCodec surface encode at the given format.
+   *
+   * @param width Encoded width in pixels.
+   * @param height Encoded height in pixels.
+   * @param codec Codec index (0 = H.264, 1 = HEVC, 2 = AV1).
+   * @param fps Target frame rate.
+   * @param bitrate_bps Target bitrate in bits per second.
+   * @return True when the app started the encoder.
+   */
+  bool video_encoder_start(int width, int height, int codec, int fps, int bitrate_bps);
+
+  /**
+   * @brief Stop MediaCodec surface encode and drop any queued access units.
+   */
+  void video_encoder_stop();
+
+  /**
+   * @brief Whether MediaCodec surface encode is currently active.
+   *
+   * @return True between a successful video_encoder_start() and video_encoder_stop().
+   */
+  bool video_encoder_active();
+
+  /**
+   * @brief Request that the next encoded frame be an IDR/sync frame.
+   */
+  void video_request_keyframe();
+
+  /**
+   * @brief Update the MediaCodec target bitrate.
+   *
+   * @param bitrate_bps New target bitrate in bits per second.
+   */
+  void video_set_bitrate(int bitrate_bps);
+
+  /**
+   * @brief Push one encoded access unit from the app's MediaCodec output thread.
+   * @details Standalone codec-config (SPS/PPS/VPS) buffers are dropped; headers are prepended to
+   *          each sync frame by MediaCodec instead.
+   *
+   * @param data Pointer to the encoded bytes.
+   * @param size Number of encoded bytes.
+   * @param flags Bit 0: keyframe. Bit 1: codec config.
+   * @param pts_us Presentation timestamp in microseconds.
+   */
+  void push_encoded(const std::uint8_t *data, int size, int flags, std::int64_t pts_us);
+
+  /**
+   * @brief Drain one encoded access unit for the streaming pipeline.
+   *
+   * @param out Destination for the access-unit bytes.
+   * @param is_idr Set to true when the access unit is a keyframe.
+   * @param timeout_ms Maximum time to wait for an access unit.
+   * @return True when an access unit was written to out; false on timeout.
+   */
+  bool pull_encoded(std::vector<std::uint8_t> &out, bool &is_idr, int timeout_ms);
+
+  /**
+   * @brief Wait until at least one encoded access unit is queued (capture pacing).
+   *
+   * @param timeout_ms Maximum time to wait.
+   * @return True when an access unit is available.
+   */
+  bool video_output_wait(int timeout_ms);
 }  // namespace jni

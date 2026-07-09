@@ -37,6 +37,10 @@ extern "C" {
 }
 #endif
 
+#ifdef __ANDROID__
+  #include "platform/android/jni_bridge.h"
+#endif
+
 using namespace std::literals;
 
 namespace video {
@@ -583,6 +587,81 @@ namespace video {
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
   };
+
+#ifdef __ANDROID__
+  /**
+   * @brief One encoded access unit produced by MediaCodec.
+   */
+  struct mediacodec_encoded_frame_t {
+    std::vector<std::uint8_t> data;  ///< Encoded access-unit bytes.
+    int64_t frame_index {0};  ///< Frame index assigned by the pipeline.
+    bool idr {false};  ///< Whether this access unit is a keyframe.
+  };
+
+  /**
+   * @brief Encode session backed by the app's MediaCodec surface encoder.
+   * @details The capture VirtualDisplay renders straight into MediaCodec's input Surface, so
+   *          frames never reach this process: convert() is a no-op and encode_frame() simply
+   *          drains the next encoded access unit from the JNI bridge.
+   */
+  class mediacodec_encode_session_t: public encode_session_t {
+  public:
+    /**
+     * @brief Stop the MediaCodec encoder and restore the preview capture on teardown.
+     */
+    ~mediacodec_encode_session_t() override {
+      jni::video_encoder_stop();
+    }
+
+    /**
+     * @brief No per-frame conversion is needed for surface input.
+     *
+     * @param img Unused captured image (pacing tick only).
+     * @return Always 0.
+     */
+    int convert(platf::img_t &img) override {
+      (void) img;
+      return 0;
+    }
+
+    /**
+     * @brief Request that the next encoded frame be an IDR/sync frame.
+     */
+    void request_idr_frame() override {
+      jni::video_request_keyframe();
+    }
+
+    /**
+     * @brief No-op: MediaCodec resumes normal frames on its own after a sync request.
+     */
+    void request_normal_frame() override {}
+
+    /**
+     * @brief MediaCodec can't invalidate specific references; force a keyframe instead.
+     *
+     * @param first_frame Unused.
+     * @param last_frame Unused.
+     */
+    void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
+      (void) first_frame;
+      (void) last_frame;
+      jni::video_request_keyframe();
+    }
+
+    /**
+     * @brief Drain the next encoded access unit from MediaCodec.
+     *
+     * @param frame_index Monotonic frame index assigned by the video pipeline.
+     * @return Encoded access unit, or empty data on timeout.
+     */
+    mediacodec_encoded_frame_t encode_frame(int64_t frame_index) {
+      mediacodec_encoded_frame_t frame;
+      frame.frame_index = frame_index;
+      jni::pull_encoded(frame.data, frame.idr, 1000);
+      return frame;
+    }
+  };
+#endif
 
   /**
    * @brief Context object used while synchronizing encode sessions.
@@ -1379,8 +1458,44 @@ namespace video {
   };
 #endif
 
+#ifdef __ANDROID__
+  /**
+   * @brief MediaCodec hardware encoder (Android).
+   * @details Frames are encoded from a MediaCodec input Surface in the host app; this process only
+   *          receives finished access units over the JNI bridge. It reuses the avcodec platform
+   *          formats purely so make_encode_device()/reset_display() work — make_encode_session()
+   *          and validate_config() intercept this encoder by name and never touch FFmpeg.
+   */
+  encoder_t mediacodec {
+    "mediacodec"sv,
+    std::make_unique<encoder_platform_formats_avcodec>(
+      AV_HWDEVICE_TYPE_NONE,
+      AV_HWDEVICE_TYPE_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NV12,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      AV_PIX_FMT_NONE,
+      nullptr
+    ),
+    {
+      {}, {}, {}, {}, {}, {},  // AV1 unsupported on most mobile encoders
+      {},
+    },
+    {
+      {}, {}, {}, {}, {}, {},
+      "hevc"s,
+    },
+    {
+      {}, {}, {}, {}, {}, {},
+      "h264"s,
+    },
+    PARALLEL_ENCODING
+  };
+#endif
+
   static const std::vector<encoder_t *> encoders {
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__ANDROID__)
     &nvenc,
 #endif
 #ifdef _WIN32
@@ -1388,7 +1503,9 @@ namespace video {
     &amdvce,
     &mediafoundation,
 #endif
-#if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
+#ifdef __ANDROID__
+    &mediacodec,
+#elif defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
   #ifdef SUNSHINE_BUILD_VULKAN
     &vulkan,
   #endif
@@ -1860,6 +1977,34 @@ namespace video {
     return 0;
   }
 
+#ifdef __ANDROID__
+  /**
+   * @brief Drain one MediaCodec access unit and queue it for transmission.
+   *
+   * @param frame_nr Frame number assigned to the encoded packet.
+   * @param session Active MediaCodec encode session.
+   * @param packets Queue receiving encoded video packets.
+   * @param channel_data Opaque channel data forwarded to the packet sender.
+   * @param frame_timestamp Capture timestamp for the frame.
+   * @return 0 when a frame is queued or benignly skipped; nonzero on unrecoverable error.
+   */
+  int encode_mediacodec(int64_t frame_nr, mediacodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    auto encoded_frame = session.encode_frame(frame_nr);
+    if (encoded_frame.data.empty()) {
+      // No access unit within the timeout (e.g. brief stall). Skip this cycle without erroring;
+      // the pipeline simply emits nothing for this frame number.
+      return 0;
+    }
+
+    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
+    packet->channel_data = channel_data;
+    packet->frame_timestamp = frame_timestamp;
+    packets->raise(std::move(packet));
+
+    return 0;
+  }
+#endif
+
   /**
    * @brief Encode one captured frame and queue packets for transmission.
    *
@@ -1876,6 +2021,11 @@ namespace video {
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
       return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
     }
+#ifdef __ANDROID__
+    else if (auto mediacodec_session = dynamic_cast<mediacodec_encode_session_t *>(&session)) {
+      return encode_mediacodec(frame_nr, *mediacodec_session, packets, channel_data, frame_timestamp);
+    }
+#endif
 
     return -1;
   }
@@ -2306,6 +2456,21 @@ namespace video {
    * @return Constructed encode session object.
    */
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
+#ifdef __ANDROID__
+    if (encoder.name == "mediacodec") {
+      (void) disp;
+      (void) width;
+      (void) height;
+      (void) encode_device;
+      // Encode at the client-negotiated resolution; the VirtualDisplay scales the device screen
+      // into MediaCodec's input Surface. bitrate is in Kbps here, MediaCodec wants bits per second.
+      if (!jni::video_encoder_start(config.width, config.height, config.videoFormat, config.framerate, config.bitrate * 1000)) {
+        BOOST_LOG(error) << "MediaCodec encoder failed to start; falling back"sv;
+        return nullptr;
+      }
+      return std::make_unique<mediacodec_encode_session_t>();
+    }
+#endif
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -2940,6 +3105,16 @@ namespace video {
    * @return 0 when the selected encoder/device accepts the configuration; nonzero otherwise.
    */
   int validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
+#ifdef __ANDROID__
+    if (encoder.name == "mediacodec") {
+      // MediaCodec can't be exercised at startup: it needs the app's input Surface, which only
+      // exists once a stream launches. Assume standard, VUI-compliant H.264/HEVC output and defer
+      // real capability to stream start (where a failure falls back to software).
+      (void) disp;
+      (void) config;
+      return VUI_PARAMS;
+    }
+#endif
     auto encode_device = make_encode_device(*disp, encoder, config);
     if (!encode_device) {
       return -1;

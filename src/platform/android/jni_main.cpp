@@ -7,6 +7,7 @@
  */
 // standard includes
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 
 // platform includes
@@ -21,6 +22,35 @@
  */
 extern "C" int main(int argc, char *argv[]);
 
+namespace {
+  JavaVM *g_jvm = nullptr;  ///< Cached Java VM for upcalls from native threads.
+  jobject g_video_bridge = nullptr;  ///< Global ref to the app's MediaCodec bridge object.
+  jmethodID g_mid_start = nullptr;  ///< VideoBridge.startEncoder(IIIII)Z.
+  jmethodID g_mid_stop = nullptr;  ///< VideoBridge.stopEncoder()V.
+  jmethodID g_mid_keyframe = nullptr;  ///< VideoBridge.requestKeyframe()V.
+  jmethodID g_mid_bitrate = nullptr;  ///< VideoBridge.setBitrate(I)V.
+
+  /**
+   * @brief Get a JNIEnv for the current thread, attaching it to the VM if needed.
+   * @details Upcalls run on native encoder threads that aren't attached to the JVM. The thread is
+   *          left attached; it is detached implicitly when it exits.
+   *
+   * @return JNIEnv for the current thread, or nullptr when no VM is available.
+   */
+  JNIEnv *upcall_env() {
+    if (!g_jvm) {
+      return nullptr;
+    }
+    JNIEnv *env = nullptr;
+    if (g_jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
+      if (g_jvm->AttachCurrentThread(&env, nullptr) != 0) {
+        return nullptr;
+      }
+    }
+    return env;
+  }
+}  // namespace
+
 extern "C" {
 
   /**
@@ -30,6 +60,7 @@ extern "C" {
    * @return Supported JNI version.
    */
   JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+    g_jvm = vm;
     jni::set_vm(vm, nullptr);
     return JNI_VERSION_1_6;
   }
@@ -122,6 +153,74 @@ extern "C" {
     auto *samples = static_cast<const float *>(env->GetDirectBufferAddress(buffer));
     if (samples) {
       jni::push_audio(samples, count);
+    }
+  }
+
+  /**
+   * @brief Register (or clear) the app object that services MediaCodec hardware encode.
+   * @details The bridge must expose startEncoder(int,int,int,int,int):bool, stopEncoder(),
+   *          requestKeyframe(), and setBitrate(int). Native encoder sessions call these via JNI.
+   *
+   * @param bridge The app-side bridge object, or null to disable hardware encode.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeSetVideoBridge(JNIEnv *env, jclass, jobject bridge) {
+    if (g_video_bridge) {
+      env->DeleteGlobalRef(g_video_bridge);
+      g_video_bridge = nullptr;
+    }
+    if (!bridge) {
+      jni::set_video_callbacks({});
+      return;
+    }
+
+    g_video_bridge = env->NewGlobalRef(bridge);
+    jclass cls = env->GetObjectClass(bridge);
+    g_mid_start = env->GetMethodID(cls, "startEncoder", "(IIIII)Z");
+    g_mid_stop = env->GetMethodID(cls, "stopEncoder", "()V");
+    g_mid_keyframe = env->GetMethodID(cls, "requestKeyframe", "()V");
+    g_mid_bitrate = env->GetMethodID(cls, "setBitrate", "(I)V");
+
+    jni::video_callbacks_t cb;
+    cb.start = [](int w, int h, int codec, int fps, int bitrate) -> bool {
+      JNIEnv *e = upcall_env();
+      if (!e || !g_video_bridge || !g_mid_start) {
+        return false;
+      }
+      return e->CallBooleanMethod(g_video_bridge, g_mid_start, w, h, codec, fps, bitrate) == JNI_TRUE;
+    };
+    cb.stop = [] {
+      JNIEnv *e = upcall_env();
+      if (e && g_video_bridge && g_mid_stop) {
+        e->CallVoidMethod(g_video_bridge, g_mid_stop);
+      }
+    };
+    cb.request_keyframe = [] {
+      JNIEnv *e = upcall_env();
+      if (e && g_video_bridge && g_mid_keyframe) {
+        e->CallVoidMethod(g_video_bridge, g_mid_keyframe);
+      }
+    };
+    cb.set_bitrate = [](int bitrate) {
+      JNIEnv *e = upcall_env();
+      if (e && g_video_bridge && g_mid_bitrate) {
+        e->CallVoidMethod(g_video_bridge, g_mid_bitrate, bitrate);
+      }
+    };
+    jni::set_video_callbacks(std::move(cb));
+  }
+
+  /**
+   * @brief Deliver one encoded access unit from the app's MediaCodec output thread.
+   *
+   * @param buffer Direct ByteBuffer holding the encoded bytes.
+   * @param size Number of encoded bytes.
+   * @param flags Bit 0: keyframe. Bit 1: codec config.
+   * @param pts_us Presentation timestamp in microseconds.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativePushEncoded(JNIEnv *env, jclass, jobject buffer, jint size, jint flags, jlong pts_us) {
+    auto *data = static_cast<const std::uint8_t *>(env->GetDirectBufferAddress(buffer));
+    if (data) {
+      jni::push_encoded(data, size, flags, pts_us);
     }
   }
 }

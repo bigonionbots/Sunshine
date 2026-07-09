@@ -46,6 +46,12 @@ class SunshineService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var captureThread: HandlerThread? = null
+    private var captureW = 0
+    private var captureH = 0
+    private var captureDpi = 0
+
+    private val encoderLock = Any()
+    private var encoder: MediaCodecEncoder? = null
 
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
@@ -142,10 +148,77 @@ class SunshineService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface, null, handler
         )
+        captureW = w
+        captureH = h
+        captureDpi = dpi
         SunshineNative.nativeCaptureStarted(w, h)
         Log.i(TAG, "capture started ${w}x$h @ ${dpi}dpi")
 
+        // Offer MediaCodec hardware encode to the core. When a stream launches, the core calls back
+        // into startEncoder() and we point this VirtualDisplay at the encoder's input Surface.
+        SunshineNative.nativeSetVideoBridge(this)
+
         startAudioCapture(mp)
+    }
+
+    // --- MediaCodec bridge (called from native encoder threads) -------------------------------
+
+    /**
+     * Start MediaCodec surface encode and redirect the capture VirtualDisplay into it. Called from
+     * the native encode thread when a stream launches; returns false to make the core fall back to
+     * software encode.
+     */
+    fun startEncoder(width: Int, height: Int, codec: Int, fps: Int, bitrateBps: Int): Boolean {
+        synchronized(encoderLock) {
+            val vd = virtualDisplay ?: return false
+            try {
+                val enc = MediaCodecEncoder(width, height, codec, fps, bitrateBps) { buf, size, flags, ptsUs ->
+                    SunshineNative.nativePushEncoded(buf, size, flags, ptsUs)
+                }
+                // Render the mirrored screen into the encoder at the client-negotiated resolution.
+                vd.resize(width, height, captureDpi)
+                vd.setSurface(enc.inputSurface)
+                encoder = enc
+                Log.i(TAG, "hardware encoder started ${width}x$height codec=$codec")
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "startEncoder failed; falling back to software", e)
+                encoder?.stop()
+                encoder = null
+                // Restore the preview surface so capture keeps working for the software path.
+                try {
+                    vd.setSurface(imageReader?.surface)
+                    vd.resize(captureW, captureH, captureDpi)
+                } catch (_: Exception) {
+                }
+                return false
+            }
+        }
+    }
+
+    /** Stop MediaCodec encode and restore the preview capture. */
+    fun stopEncoder() {
+        synchronized(encoderLock) {
+            val enc = encoder ?: return
+            encoder = null
+            try {
+                virtualDisplay?.setSurface(imageReader?.surface)
+                virtualDisplay?.resize(captureW, captureH, captureDpi)
+            } catch (_: Exception) {
+            }
+            enc.stop()
+            Log.i(TAG, "hardware encoder stopped")
+        }
+    }
+
+    /** Ask MediaCodec for an IDR/sync frame. */
+    fun requestKeyframe() {
+        synchronized(encoderLock) { encoder?.requestKeyframe() }
+    }
+
+    /** Update the MediaCodec target bitrate (bits per second). */
+    fun setBitrate(bitrateBps: Int) {
+        synchronized(encoderLock) { encoder?.setBitrate(bitrateBps) }
     }
 
     /**
@@ -231,6 +304,8 @@ class SunshineService : Service() {
     }
 
     private fun stopCapture() {
+        SunshineNative.nativeSetVideoBridge(null)
+        stopEncoder()
         stopAudioCapture()
         SunshineNative.nativeCaptureStopped()
         virtualDisplay?.release()

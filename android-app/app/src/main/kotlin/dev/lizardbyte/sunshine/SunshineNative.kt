@@ -51,4 +51,18 @@ object SunshineNative {
      * [count] is the number of float samples it holds (frames * channels).
      */
     external fun nativePushAudio(buffer: java.nio.ByteBuffer, count: Int)
+
+    /**
+     * Register (or clear with null) the object that services MediaCodec hardware encode. It must
+     * expose startEncoder(Int,Int,Int,Int,Int):Boolean, stopEncoder(), requestKeyframe(), and
+     * setBitrate(Int); the native encoder session calls these.
+     */
+    external fun nativeSetVideoBridge(bridge: Any?)
+
+    /**
+     * Deliver one encoded access unit from MediaCodec. [buffer] must be a direct ByteBuffer holding
+     * [size] bytes. [flags] bit 0 = keyframe, bit 1 = codec config. [ptsUs] is the presentation
+     * timestamp in microseconds.
+     */
+    external fun nativePushEncoded(buffer: java.nio.ByteBuffer, size: Int, flags: Int, ptsUs: Long)
 }
