@@ -47,6 +47,12 @@ elseif(ANDROID)
     # stack. Skip the Linux capture options entirely and force the tray off so the desktop
     # code paths are never pulled into the build.
     set(SUNSHINE_ENABLE_TRAY OFF CACHE BOOL "Enable system tray icon." FORCE)
+
+    # When ON, build libsunshine.so (a shared library with a JNI entry point) for embedding in
+    # the Android app, instead of a standalone executable. The standalone executable is still
+    # useful for shell/adb testing, so this defaults OFF.
+    option(SUNSHINE_BUILD_ANDROID_LIBRARY
+            "Build libsunshine.so for the Android app instead of a standalone executable." OFF)
 elseif(UNIX)  # Linux
     option(SUNSHINE_BUILD_APPIMAGE
             "Enable an AppImage build." OFF)

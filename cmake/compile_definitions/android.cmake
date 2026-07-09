@@ -38,6 +38,11 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/android/jni_bridge.h"
         "${CMAKE_SOURCE_DIR}/src/platform/android/jni_bridge.cpp")
 
+# The JNI entry point is only needed when building the shared library for the app.
+if(SUNSHINE_BUILD_ANDROID_LIBRARY)
+    list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/src/platform/android/jni_main.cpp")
+endif()
+
 # NDK system libraries. `log` and `android` are always needed; the media/aaudio libs
 # come online as the corresponding backends are implemented.
 list(APPEND PLATFORM_LIBRARIES

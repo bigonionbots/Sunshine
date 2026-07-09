@@ -3,6 +3,14 @@
 
 if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
     add_executable(sunshine MACOSX_BUNDLE ${SUNSHINE_TARGET_FILES})
+elseif(ANDROID AND SUNSHINE_BUILD_ANDROID_LIBRARY)
+    # The Android app loads the core via System.loadLibrary("sunshine"); build a shared library
+    # (libsunshine.so) with the JNI entry point rather than an executable.
+    add_library(sunshine SHARED ${SUNSHINE_TARGET_FILES})
+    # FFmpeg's aarch64 asm references its internal data tables (ff_tx_tab_*) with direct ADRP+ADD
+    # relocations, which the linker rejects against preemptible symbols in a shared object. Bind
+    # symbols locally so those references are non-preemptible and the relocations are allowed.
+    target_link_options(sunshine PRIVATE "-Wl,-Bsymbolic")
 else()
     add_executable(sunshine ${SUNSHINE_TARGET_FILES})
 endif()

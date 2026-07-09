@@ -108,6 +108,7 @@ cmake -G Ninja ../../source \
   -DCMAKE_INSTALL_PREFIX="$OUT" \
   -DENABLE_SHARED=OFF \
   -DENABLE_CLI=OFF \
+  -DENABLE_PIC=ON \
   ${X265_ASM_FLAG}
 ninja
 ninja install
@@ -150,7 +151,7 @@ make distclean >/dev/null 2>&1 || true
   --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --nm="$NM" --strip="$STRIP" \
   --sysroot="$SYSROOT" \
   --enable-gpl --enable-version3 \
-  --enable-static --disable-shared \
+  --enable-static --disable-shared --enable-pic \
   --disable-programs --disable-doc \
   --disable-avdevice --disable-avformat --disable-network \
   ${FFMPEG_ASM_FLAG} \

@@ -125,6 +125,8 @@ namespace platf {
     bool fb_swap_rb {false};  ///< Whether the framebuffer stores red in the low byte (RGB -> needs swap).
     bool use_framebuffer {false};  ///< True when framebuffer capture is active.
 
+    bool use_jni_capture {false};  ///< True when frames are delivered by the app (MediaProjection).
+
     // screencap fallback state.
     std::vector<std::uint8_t> capture_buf;  ///< Reused buffer for raw screencap output.
 
@@ -230,6 +232,28 @@ namespace platf {
     }
 
     /**
+     * @brief Copy the latest app-delivered (MediaProjection) frame into the image.
+     *
+     * @param img Destination image (must match the negotiated display dimensions).
+     * @return True on a successful copy; false if no frame yet or the size changed (reinit).
+     */
+    bool grab_jni(img_t *img) {
+      if (!img || !img->data) {
+        return false;
+      }
+      switch (jni::copy_latest_frame(img->data, width, height, img->row_pitch)) {
+        case jni::frame_status::ok:
+          return true;
+        case jni::frame_status::resize:
+          pending_reinit = true;  // capture dimensions changed; rebuild at the new size
+          return false;
+        case jni::frame_status::none:
+        default:
+          return false;  // no frame yet; caller emits black
+      }
+    }
+
+    /**
      * @brief Grab one screen frame via the `screencap` tool (fallback path).
      *
      * @param img Destination image (must match the negotiated display dimensions).
@@ -287,7 +311,14 @@ namespace platf {
           return capture_e::ok;  // capture interrupted
         }
 
-        bool ok = use_framebuffer ? grab_framebuffer(img.get()) : grab_screen(img.get());
+        bool ok;
+        if (use_jni_capture) {
+          ok = grab_jni(img.get());
+        } else if (use_framebuffer) {
+          ok = grab_framebuffer(img.get());
+        } else {
+          ok = grab_screen(img.get());
+        }
         if (pending_reinit) {
           return capture_e::reinit;  // display resolution changed (e.g. rotation); rebuild the pipeline
         }
@@ -333,8 +364,17 @@ namespace platf {
     auto disp = std::make_shared<android_display_t>();
     disp->delay = video::capture_frame_interval(config);
 
-    // Prefer the direct framebuffer (fast, persistent). Fall back to screencap.
-    if (!disp->init_framebuffer()) {
+    // Preferred: app-delivered frames via MediaProjection (works as a normal app; GPU-side, no
+    // readback stall). Then the direct framebuffer (rooted/VM). Then the screencap tool.
+    if (jni::capture_active()) {
+      int w = 0;
+      int h = 0;
+      jni::capture_size(w, h);
+      disp->use_jni_capture = true;
+      disp->width = w;
+      disp->height = h;
+      BOOST_LOG(info) << "android: using MediaProjection capture "sv << w << "x"sv << h;
+    } else if (!disp->init_framebuffer()) {
       auto metrics = jni::display_metrics();
       int w = metrics.width;
       int h = metrics.height;
