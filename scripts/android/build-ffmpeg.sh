@@ -65,6 +65,16 @@ else
   FFMPEG_ASM_FLAG=""
 fi
 
+# x265's aarch64 assembly build invokes the compiler on its .S files without the toolchain's
+# --target flag, so under the NDK it compiles for the host (x86) and fails with
+# "unknown target CPU 'armv8-a'". Disable x265 assembly on arm targets (HEVC still works via its
+# C path); x264 and FFmpeg use the target-wrapped compiler and keep their NEON assembly.
+case "$ABI" in
+  arm64-v8a | armeabi-v7a)
+    X265_ASM_FLAG="-DENABLE_ASSEMBLY=OFF"
+    ;;
+esac
+
 echo "==> ABI=$ABI  API=$API  triple=$TRIPLE  out=$OUT"
 
 # --- 1) x264 (static, PIC) -------------------------------------------------------------
