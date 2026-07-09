@@ -265,6 +265,24 @@ namespace jni {
     }
   }
 
+  void alloc_gamepad(int slot) {
+    if (g_input_cb.alloc_gamepad) {
+      g_input_cb.alloc_gamepad(slot);
+    }
+  }
+
+  void inject_gamepad(int slot, int buttons, float lx, float ly, float rx, float ry, float lt, float rt) {
+    if (g_input_cb.inject_gamepad) {
+      g_input_cb.inject_gamepad(slot, buttons, lx, ly, rx, ry, lt, rt);
+    }
+  }
+
+  void free_gamepad(int slot) {
+    if (g_input_cb.free_gamepad) {
+      g_input_cb.free_gamepad(slot);
+    }
+  }
+
   void set_video_callbacks(video_callbacks_t callbacks) {
     g_video_cb = std::move(callbacks);
   }

@@ -301,7 +301,14 @@ namespace platf {
   }
 
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
-    // TODO: drive a uinput virtual gamepad (ABS axes + BTN_ buttons).
+    jni::inject_gamepad(nr,
+      static_cast<int>(gamepad_state.buttonFlags),
+      gamepad_state.lsX / 32767.f,
+      gamepad_state.lsY / 32767.f,
+      gamepad_state.rsX / 32767.f,
+      gamepad_state.rsY / 32767.f,
+      gamepad_state.lt / 255.f,
+      gamepad_state.rt / 255.f);
   }
 
   std::unique_ptr<client_input_t> allocate_client_input_context(input_t &input) {
@@ -323,15 +330,17 @@ namespace platf {
   void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {}
 
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
-    // TODO: create a virtual gamepad; return 0 on success.
-    return -1;
+    jni::alloc_gamepad(id.globalIndex);
+    return 0;
   }
 
-  void free_gamepad(input_t &input, int nr) {}
+  void free_gamepad(input_t &input, int nr) {
+    jni::free_gamepad(nr);
+  }
 
   std::vector<supported_gamepad_t> &supported_gamepads(input_t *input) {
     static std::vector<supported_gamepad_t> gamepads {
-      {"gamepad"s, false, "not yet implemented on android"s},
+      {"gamepad"s, true, ""s},
     };
     return gamepads;
   }

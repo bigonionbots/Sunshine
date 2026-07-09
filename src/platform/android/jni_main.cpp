@@ -171,6 +171,9 @@ extern "C" {
     static jmethodID g_mid_mouse_btn = nullptr;
     static jmethodID g_mid_scroll = nullptr;
     static jmethodID g_mid_hscroll = nullptr;
+    static jmethodID g_mid_alloc_gp = nullptr;
+    static jmethodID g_mid_free_gp = nullptr;
+    static jmethodID g_mid_inject_gp = nullptr;
 
     if (g_input_bridge) {
       env->DeleteGlobalRef(g_input_bridge);
@@ -188,6 +191,9 @@ extern "C" {
     g_mid_mouse_btn  = env->GetMethodID(cls, "injectMouseButton", "(IZ)V");
     g_mid_scroll     = env->GetMethodID(cls, "injectScroll", "(I)V");
     g_mid_hscroll    = env->GetMethodID(cls, "injectHScroll", "(I)V");
+    g_mid_alloc_gp   = env->GetMethodID(cls, "allocGamepad", "(I)V");
+    g_mid_free_gp    = env->GetMethodID(cls, "freeGamepad", "(I)V");
+    g_mid_inject_gp  = env->GetMethodID(cls, "injectGamepadState", "(IIFFFFFF)V");
 
     jni::input_callbacks_t cb;
     cb.inject_key = [](int vk, bool pressed) {
@@ -218,6 +224,27 @@ extern "C" {
       JNIEnv *e = upcall_env();
       if (e && g_input_bridge && g_mid_hscroll) {
         e->CallVoidMethod(g_input_bridge, g_mid_hscroll, distance);
+      }
+    };
+    cb.alloc_gamepad = [](int slot) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_alloc_gp) {
+        e->CallVoidMethod(g_input_bridge, g_mid_alloc_gp, slot);
+      }
+    };
+    cb.free_gamepad = [](int slot) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_free_gp) {
+        e->CallVoidMethod(g_input_bridge, g_mid_free_gp, slot);
+      }
+    };
+    cb.inject_gamepad = [](int slot, int buttons, float lx, float ly, float rx, float ry, float lt, float rt) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_inject_gp) {
+        e->CallVoidMethod(g_input_bridge, g_mid_inject_gp, slot, buttons,
+          static_cast<jfloat>(lx), static_cast<jfloat>(ly),
+          static_cast<jfloat>(rx), static_cast<jfloat>(ry),
+          static_cast<jfloat>(lt), static_cast<jfloat>(rt));
       }
     };
     jni::set_input_callbacks(std::move(cb));

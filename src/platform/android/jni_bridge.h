@@ -280,6 +280,9 @@ namespace jni {
     std::function<void(int button, bool pressed)> inject_mouse_button;  ///< Mouse button.
     std::function<void(int distance)> inject_scroll;  ///< Vertical scroll (1/120 notch units).
     std::function<void(int distance)> inject_hscroll;  ///< Horizontal scroll.
+    std::function<void(int slot)> alloc_gamepad;  ///< Allocate a virtual gamepad slot.
+    std::function<void(int slot, int buttons, float lx, float ly, float rx, float ry, float lt, float rt)> inject_gamepad;  ///< Deliver gamepad state.
+    std::function<void(int slot)> free_gamepad;  ///< Release a virtual gamepad slot.
   };
 
   /**
@@ -333,4 +336,29 @@ namespace jni {
    * @param distance Scroll distance in 1/120-wheel-notch units (positive = right).
    */
   void inject_hscroll(int distance);
+
+  /**
+   * @brief Allocate a virtual gamepad in the given slot.
+   * @param slot Gamepad slot index (0–3).
+   */
+  void alloc_gamepad(int slot);
+
+  /**
+   * @brief Deliver a full gamepad state snapshot.
+   * @param slot Gamepad slot.
+   * @param buttons Moonlight button bitmask.
+   * @param lx Left stick X, -1..1.
+   * @param ly Left stick Y, -1..1 (positive = down).
+   * @param rx Right stick X, -1..1.
+   * @param ry Right stick Y, -1..1.
+   * @param lt Left trigger, 0..1.
+   * @param rt Right trigger, 0..1.
+   */
+  void inject_gamepad(int slot, int buttons, float lx, float ly, float rx, float ry, float lt, float rt);
+
+  /**
+   * @brief Release a virtual gamepad slot.
+   * @param slot Gamepad slot index (0–3).
+   */
+  void free_gamepad(int slot);
 }  // namespace jni

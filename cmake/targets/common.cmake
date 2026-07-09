@@ -11,6 +11,12 @@ elseif(ANDROID AND SUNSHINE_BUILD_ANDROID_LIBRARY)
     # relocations, which the linker rejects against preemptible symbols in a shared object. Bind
     # symbols locally so those references are non-preemptible and the relocations are allowed.
     target_link_options(sunshine PRIVATE "-Wl,-Bsymbolic")
+
+    # Micro-library loaded by the Shizuku UserService (shell process).
+    # Contains ONLY uinput device creation and event-write helpers.
+    # Must NOT link anything from libsunshine.so or its dependencies.
+    add_library(sunshine_input SHARED src/platform/android/uinput_helper.cpp)
+
 else()
     add_executable(sunshine ${SUNSHINE_TARGET_FILES})
 endif()
