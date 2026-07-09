@@ -12,23 +12,6 @@
 
 namespace platf {
   /**
-   * @brief Create and configure a uinput virtual mouse device.
-   * @details Intended to be called from the Shizuku UserService (running as shell) which has
-   *          SELinux permission to open /dev/uinput. The open fd is returned to the caller;
-   *          ownership transfers to the caller (it should be wrapped in a ParcelFileDescriptor
-   *          and closed after Binder transmission).
-   *
-   * @return Open uinput fd on success, -1 on failure.
-   */
-  int android_create_uinput_mouse();
-
-  /**
-   * @brief Create and configure a uinput virtual keyboard device (same context as mouse).
-   *
-   * @return Open uinput fd on success, -1 on failure.
-   */
-  int android_create_uinput_keyboard();
-  /**
    * @brief Owning wrapper for the Android platform input backend.
    * @details Allocated by `platf::input()` and released by `platf::freeInput()`.
    *          On rooted devices this owns the `/dev/uinput` virtual device handles.

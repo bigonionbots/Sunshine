@@ -180,33 +180,15 @@ namespace platf {
   input_t input() {
     auto state = new android_input_t {};
 
-    // Prefer fds that the Shizuku UserService (shell) pre-opened — these register real uinput
-    // devices, making the mouse cursor visible. Fall back to opening uinput directly (works with
-    // root), then to the injectInputEvent JNI path (no cursor, but functional).
-    int shizuku_mouse = -1;
-    int shizuku_kb = -1;
-    jni::get_uinput_fds(shizuku_mouse, shizuku_kb);
-
-    if (shizuku_mouse >= 0) {
-      state->uinput_mouse_fd = shizuku_mouse;
-      BOOST_LOG(info) << "android input: using Shizuku-provided mouse uinput fd"sv;
-    } else {
-      state->uinput_mouse_fd = android_create_uinput_mouse();
-    }
-
-    if (shizuku_kb >= 0) {
-      state->uinput_keyboard_fd = shizuku_kb;
-      BOOST_LOG(info) << "android input: using Shizuku-provided keyboard uinput fd"sv;
-    } else {
-      state->uinput_keyboard_fd = android_create_uinput_keyboard();
-    }
+    state->uinput_mouse_fd = android_create_uinput_mouse();
+    state->uinput_keyboard_fd = android_create_uinput_keyboard();
 
     if (state->uinput_mouse_fd >= 0 || state->uinput_keyboard_fd >= 0) {
       BOOST_LOG(info) << "android input: uinput devices ready (mouse="sv << (state->uinput_mouse_fd >= 0)
                       << " keyboard="sv << (state->uinput_keyboard_fd >= 0) << ")"sv;
     } else {
-      // No uinput available at all — fall back to injectInputEvent via Shizuku AIDL.
-      // This path is checked dynamically in each handler, so late Shizuku registration is fine.
+      // uinput unavailable (non-root) — fall back to injectInputEvent via Shizuku AIDL.
+      // Each handler checks the fd at call time, so late Shizuku bridge registration is fine.
       BOOST_LOG(info) << "android input: uinput unavailable; will use Shizuku event injection"sv;
     }
     return input_t {state};
