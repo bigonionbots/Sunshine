@@ -3109,9 +3109,12 @@ namespace video {
     if (encoder.name == "mediacodec") {
       // MediaCodec can't be exercised at startup: it needs the app's input Surface, which only
       // exists once a stream launches. Assume standard, VUI-compliant H.264/HEVC output and defer
-      // real capability to stream start (where a failure falls back to software).
+      // real capability to stream start (where a failure falls back to software). AV1 encode is
+      // unavailable on virtually all mobile MediaCodec encoders, so don't advertise it.
       (void) disp;
-      (void) config;
+      if (config.videoFormat == 2) {
+        return -1;
+      }
       return VUI_PARAMS;
     }
 #endif
