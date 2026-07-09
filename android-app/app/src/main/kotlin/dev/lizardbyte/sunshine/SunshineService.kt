@@ -64,10 +64,16 @@ class SunshineService : Service() {
             nativeThread = thread(name = "sunshine-native", isDaemon = true) {
                 Log.i(TAG, "starting native core, dataDir=${filesDir.absolutePath}")
                 val rc = SunshineNative.nativeStart(filesDir.absolutePath)
-                Log.i(TAG, "native core exited: $rc")
+                // The core owns process-global state and can't be cleanly re-initialized, and its
+                // shutdown watchdog assumes the process exits after it returns. So run one core per
+                // process and terminate when it stops; a future Start spawns a fresh process.
+                Log.i(TAG, "native core exited ($rc); terminating process")
+                android.os.Process.killProcess(android.os.Process.myPid())
             }
         }
-        return START_STICKY
+        // NOT_STICKY: never auto-restart without a fresh MediaProjection token (a restart would
+        // otherwise run with no capture).
+        return START_NOT_STICKY
     }
 
     private fun startCapture(resultCode: Int, resultData: Intent) {
