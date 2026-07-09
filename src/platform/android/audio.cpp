@@ -95,12 +95,18 @@ namespace platf {
       }
 
       /**
-       * @brief No named sinks to report on Android.
+       * @brief Report a placeholder sink so the audio pipeline initializes.
+       * @details Android has no routable/virtual sinks, but the caller treats a missing sink_t as
+       *          a hard failure and discards the whole controller. Returning a valid sink_t with a
+       *          non-empty host name (and no virtual sinks) keeps audio capture alive; set_sink is
+       *          a no-op, so the name itself is never acted on.
        *
-       * @return std::nullopt.
+       * @return A sink_t naming the implicit device output.
        */
       std::optional<sink_t> sink_info() override {
-        return std::nullopt;
+        sink_t sink;
+        sink.host = "android-playback";
+        return sink;
       }
     };
   }  // namespace

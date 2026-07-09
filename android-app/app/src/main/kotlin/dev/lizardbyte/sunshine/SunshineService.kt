@@ -201,7 +201,10 @@ class SunshineService : Service() {
             while (audioRunning) {
                 val n = record.read(tmp, 0, floats, AudioRecord.READ_BLOCKING)
                 if (n <= 0) {
-                    if (n == AudioRecord.ERROR_INVALID_OPERATION || n == AudioRecord.ERROR_DEAD_OBJECT) break
+                    if (n == AudioRecord.ERROR_INVALID_OPERATION || n == AudioRecord.ERROR_DEAD_OBJECT) {
+                        Log.e(TAG, "AudioRecord.read fatal error $n; stopping audio thread")
+                        break
+                    }
                     continue
                 }
                 fb.clear()
