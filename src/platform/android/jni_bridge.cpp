@@ -32,6 +32,7 @@ namespace jni {
     std::atomic<int> g_capture_w {0};  ///< Advertised capture width.
     std::atomic<int> g_capture_h {0};  ///< Advertised capture height.
 
+    input_callbacks_t g_input_cb;  ///< App-side Shizuku input callbacks (empty when headless).
     video_callbacks_t g_video_cb;  ///< App-side MediaCodec callbacks (empty when headless).
     std::atomic<bool> g_video_active {false};  ///< Whether MediaCodec surface encode is running.
 
@@ -224,6 +225,44 @@ namespace jni {
       }
     }
     return true;
+  }
+
+  void set_input_callbacks(input_callbacks_t callbacks) {
+    g_input_cb = std::move(callbacks);
+  }
+
+  bool input_available() {
+    return static_cast<bool>(g_input_cb.inject_key) && static_cast<bool>(g_input_cb.inject_mouse_move);
+  }
+
+  void inject_key(int vk_code, bool pressed) {
+    if (g_input_cb.inject_key) {
+      g_input_cb.inject_key(vk_code, pressed);
+    }
+  }
+
+  void inject_mouse_move(float dx, float dy) {
+    if (g_input_cb.inject_mouse_move) {
+      g_input_cb.inject_mouse_move(dx, dy);
+    }
+  }
+
+  void inject_mouse_button(int button, bool pressed) {
+    if (g_input_cb.inject_mouse_button) {
+      g_input_cb.inject_mouse_button(button, pressed);
+    }
+  }
+
+  void inject_scroll(int distance) {
+    if (g_input_cb.inject_scroll) {
+      g_input_cb.inject_scroll(distance);
+    }
+  }
+
+  void inject_hscroll(int distance) {
+    if (g_input_cb.inject_hscroll) {
+      g_input_cb.inject_hscroll(distance);
+    }
   }
 
   void set_video_callbacks(video_callbacks_t callbacks) {

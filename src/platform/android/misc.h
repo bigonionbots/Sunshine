@@ -22,5 +22,6 @@ namespace platf {
     int uinput_touch_fd {-1};  ///< File descriptor for the virtual touchscreen uinput device, or -1 if unavailable.
     double abs_x {0};  ///< Tracked virtual cursor X, used to turn absolute moves into relative deltas.
     double abs_y {0};  ///< Tracked virtual cursor Y, used to turn absolute moves into relative deltas.
+    bool use_jni_input {false};  ///< True when uinput is unavailable and JNI/Shizuku injection is used instead.
   };
 }  // namespace platf

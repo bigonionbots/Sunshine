@@ -157,6 +157,73 @@ extern "C" {
   }
 
   /**
+   * @brief Register (or clear) the Shizuku IInputBridge object for non-root input injection.
+   * @details The bridge object (IInputBridge.Stub implementation) lives in the Shizuku UserService
+   *          process; calls go over Binder IPC and execute under the shell SELinux context which
+   *          holds android.permission.INJECT_EVENTS.
+   *
+   * @param bridge The IInputBridge AIDL stub, or null to disable non-root input.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeSetInputBridge(JNIEnv *env, jclass, jobject bridge) {
+    static jobject g_input_bridge = nullptr;
+    static jmethodID g_mid_inject_key = nullptr;
+    static jmethodID g_mid_mouse_move = nullptr;
+    static jmethodID g_mid_mouse_btn = nullptr;
+    static jmethodID g_mid_scroll = nullptr;
+    static jmethodID g_mid_hscroll = nullptr;
+
+    if (g_input_bridge) {
+      env->DeleteGlobalRef(g_input_bridge);
+      g_input_bridge = nullptr;
+    }
+    if (!bridge) {
+      jni::set_input_callbacks({});
+      return;
+    }
+
+    g_input_bridge = env->NewGlobalRef(bridge);
+    jclass cls = env->GetObjectClass(bridge);
+    g_mid_inject_key = env->GetMethodID(cls, "injectKey", "(IZ)V");
+    g_mid_mouse_move = env->GetMethodID(cls, "injectMouseMove", "(FF)V");
+    g_mid_mouse_btn  = env->GetMethodID(cls, "injectMouseButton", "(IZ)V");
+    g_mid_scroll     = env->GetMethodID(cls, "injectScroll", "(I)V");
+    g_mid_hscroll    = env->GetMethodID(cls, "injectHScroll", "(I)V");
+
+    jni::input_callbacks_t cb;
+    cb.inject_key = [](int vk, bool pressed) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_inject_key) {
+        e->CallVoidMethod(g_input_bridge, g_mid_inject_key, vk, static_cast<jboolean>(pressed));
+      }
+    };
+    cb.inject_mouse_move = [](float dx, float dy) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_mouse_move) {
+        e->CallVoidMethod(g_input_bridge, g_mid_mouse_move, static_cast<jfloat>(dx), static_cast<jfloat>(dy));
+      }
+    };
+    cb.inject_mouse_button = [](int button, bool pressed) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_mouse_btn) {
+        e->CallVoidMethod(g_input_bridge, g_mid_mouse_btn, button, static_cast<jboolean>(pressed));
+      }
+    };
+    cb.inject_scroll = [](int distance) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_scroll) {
+        e->CallVoidMethod(g_input_bridge, g_mid_scroll, distance);
+      }
+    };
+    cb.inject_hscroll = [](int distance) {
+      JNIEnv *e = upcall_env();
+      if (e && g_input_bridge && g_mid_hscroll) {
+        e->CallVoidMethod(g_input_bridge, g_mid_hscroll, distance);
+      }
+    };
+    jni::set_input_callbacks(std::move(cb));
+  }
+
+  /**
    * @brief Register (or clear) the app object that services MediaCodec hardware encode.
    * @details The bridge must expose startEncoder(int,int,int,int,int):bool, stopEncoder(),
    *          requestKeyframe(), and setBitrate(int). Native encoder sessions call these via JNI.

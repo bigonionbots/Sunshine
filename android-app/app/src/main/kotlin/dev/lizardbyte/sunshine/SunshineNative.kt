@@ -53,6 +53,12 @@ object SunshineNative {
     external fun nativePushAudio(buffer: java.nio.ByteBuffer, count: Int)
 
     /**
+     * Register (or clear with null) the IInputBridge AIDL object from the Shizuku UserService.
+     * When set, the native input backend routes keyboard/mouse events through it instead of uinput.
+     */
+    external fun nativeSetInputBridge(bridge: Any?)
+
+    /**
      * Register (or clear with null) the object that services MediaCodec hardware encode. It must
      * expose startEncoder(Int,Int,Int,Int,Int):Boolean, stopEncoder(), requestKeyframe(), and
      * setBitrate(Int); the native encoder session calls these.

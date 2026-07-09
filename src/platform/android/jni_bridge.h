@@ -263,4 +263,74 @@ namespace jni {
    * @return True when an access unit is available.
    */
   bool video_output_wait(int timeout_ms);
+
+  // --- Shizuku / non-root input injection --------------------------------------------------
+  //
+  // When /dev/uinput is unavailable (no root), the app connects to a Shizuku UserService running
+  // as shell, which holds android.permission.INJECT_EVENTS. These functions dispatch input events
+  // through app-provided callbacks that call into that service via AIDL Binder IPC.
+
+  /**
+   * @brief App-side callbacks that deliver input events to the Shizuku UserService.
+   * @details All functions are optional; a nullptr means "not available" for that event type.
+   */
+  struct input_callbacks_t {
+    std::function<void(int vk_code, bool pressed)> inject_key;  ///< Keyboard key press/release.
+    std::function<void(float dx, float dy)> inject_mouse_move;  ///< Relative mouse movement.
+    std::function<void(int button, bool pressed)> inject_mouse_button;  ///< Mouse button.
+    std::function<void(int distance)> inject_scroll;  ///< Vertical scroll (1/120 notch units).
+    std::function<void(int distance)> inject_hscroll;  ///< Horizontal scroll.
+  };
+
+  /**
+   * @brief Register (or clear) the app-side input callbacks.
+   *
+   * @param callbacks Populated callback set, or default-constructed to disable.
+   */
+  void set_input_callbacks(input_callbacks_t callbacks);
+
+  /**
+   * @brief Whether app-side input callbacks are registered.
+   *
+   * @return True when inject_key and inject_mouse_move are both set.
+   */
+  bool input_available();
+
+  /**
+   * @brief Inject a keyboard key press or release.
+   *
+   * @param vk_code Windows virtual-key code (the value Moonlight sends).
+   * @param pressed True for key-down, false for key-up.
+   */
+  void inject_key(int vk_code, bool pressed);
+
+  /**
+   * @brief Inject relative mouse movement.
+   *
+   * @param dx Horizontal delta in pixels.
+   * @param dy Vertical delta in pixels.
+   */
+  void inject_mouse_move(float dx, float dy);
+
+  /**
+   * @brief Inject a mouse button press or release.
+   *
+   * @param button Button index: 1=left 2=right 4=middle 8=X1 16=X2.
+   * @param pressed True for press, false for release.
+   */
+  void inject_mouse_button(int button, bool pressed);
+
+  /**
+   * @brief Inject a vertical scroll event.
+   *
+   * @param distance Scroll distance in 1/120-wheel-notch units (positive = up).
+   */
+  void inject_scroll(int distance);
+
+  /**
+   * @brief Inject a horizontal scroll event.
+   *
+   * @param distance Scroll distance in 1/120-wheel-notch units (positive = right).
+   */
+  void inject_hscroll(int distance);
 }  // namespace jni

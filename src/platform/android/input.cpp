@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 // local includes
+#include "src/platform/android/jni_bridge.h"
 #include "src/platform/android/misc.h"
 #include "src/platform/common.h"
 #include "src/logging.h"
@@ -176,8 +177,13 @@ namespace platf {
     });
 
     if (state->uinput_mouse_fd >= 0 || state->uinput_keyboard_fd >= 0) {
-      BOOST_LOG(info) << "android input: virtual devices created (mouse="sv << (state->uinput_mouse_fd >= 0)
+      BOOST_LOG(info) << "android input: virtual uinput devices created (mouse="sv << (state->uinput_mouse_fd >= 0)
                       << ", keyboard="sv << (state->uinput_keyboard_fd >= 0) << ")"sv;
+    } else if (jni::input_available()) {
+      state->use_jni_input = true;
+      BOOST_LOG(info) << "android input: using Shizuku injection (non-root)"sv;
+    } else {
+      BOOST_LOG(warning) << "android input: no input method available (uinput denied, no Shizuku)"sv;
     }
     return input_t {state};
   }
@@ -191,55 +197,68 @@ namespace platf {
     auto *state = raw(input);
     state->abs_x += deltaX;
     state->abs_y += deltaY;
+    if (state->use_jni_input) {
+      jni::inject_mouse_move(static_cast<float>(deltaX), static_cast<float>(deltaY));
+      return;
+    }
     emit(state->uinput_mouse_fd, EV_REL, REL_X, deltaX);
     emit(state->uinput_mouse_fd, EV_REL, REL_Y, deltaY);
     emit_syn(state->uinput_mouse_fd);
   }
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
-    // The mouse is a relative device, so move by the delta from our tracked position to the
-    // absolute target. Accurate as long as Android applies our deltas without acceleration; for
-    // precise absolute pointing, use Moonlight's relative mouse mode instead.
     auto *state = raw(input);
     int deltaX = static_cast<int>(std::lround(x - state->abs_x));
     int deltaY = static_cast<int>(std::lround(y - state->abs_y));
     state->abs_x = x;
     state->abs_y = y;
+    if (state->use_jni_input) {
+      jni::inject_mouse_move(static_cast<float>(deltaX), static_cast<float>(deltaY));
+      return;
+    }
     emit(state->uinput_mouse_fd, EV_REL, REL_X, deltaX);
     emit(state->uinput_mouse_fd, EV_REL, REL_Y, deltaY);
     emit_syn(state->uinput_mouse_fd);
   }
 
   void button_mouse(input_t &input, int button, bool release) {
+    auto *state = raw(input);
+    if (state->use_jni_input) {
+      // Map BUTTON_* enum to the power-of-two values the AIDL and UserService expect.
+      int jni_btn = 0;
+      switch (button) {
+        case BUTTON_LEFT:   jni_btn = 1;  break;
+        case BUTTON_RIGHT:  jni_btn = 2;  break;
+        case BUTTON_MIDDLE: jni_btn = 4;  break;
+        case BUTTON_X1:     jni_btn = 8;  break;
+        case BUTTON_X2:     jni_btn = 16; break;
+        default: return;
+      }
+      jni::inject_mouse_button(jni_btn, !release);
+      return;
+    }
     int btn;
     switch (button) {
-      case BUTTON_LEFT:
-        btn = BTN_LEFT;
-        break;
-      case BUTTON_MIDDLE:
-        btn = BTN_MIDDLE;
-        break;
-      case BUTTON_RIGHT:
-        btn = BTN_RIGHT;
-        break;
-      case BUTTON_X1:
-        btn = BTN_SIDE;
-        break;
-      case BUTTON_X2:
-        btn = BTN_EXTRA;
-        break;
+      case BUTTON_LEFT:   btn = BTN_LEFT;  break;
+      case BUTTON_MIDDLE: btn = BTN_MIDDLE; break;
+      case BUTTON_RIGHT:  btn = BTN_RIGHT; break;
+      case BUTTON_X1:     btn = BTN_SIDE;  break;
+      case BUTTON_X2:     btn = BTN_EXTRA; break;
       default:
         BOOST_LOG(warning) << "android input: unknown mouse button "sv << button;
         return;
     }
-    auto *state = raw(input);
     emit(state->uinput_mouse_fd, EV_KEY, btn, release ? 0 : 1);
     emit_syn(state->uinput_mouse_fd);
   }
 
   void scroll(input_t &input, int distance) {
-    // Moonlight sends high-resolution scroll in 1/120 units (120 == one notch).
     auto *state = raw(input);
+    if (state->use_jni_input) {
+      jni::inject_scroll(distance);
+      return;
+    }
+    // Moonlight sends high-resolution scroll in 1/120 units (120 == one notch).
     emit(state->uinput_mouse_fd, EV_REL, REL_WHEEL_HI_RES, distance);
     emit(state->uinput_mouse_fd, EV_REL, REL_WHEEL, static_cast<int>(std::lround(distance / 120.0)));
     emit_syn(state->uinput_mouse_fd);
@@ -247,18 +266,26 @@ namespace platf {
 
   void hscroll(input_t &input, int distance) {
     auto *state = raw(input);
+    if (state->use_jni_input) {
+      jni::inject_hscroll(distance);
+      return;
+    }
     emit(state->uinput_mouse_fd, EV_REL, REL_HWHEEL_HI_RES, distance);
     emit(state->uinput_mouse_fd, EV_REL, REL_HWHEEL, static_cast<int>(std::lround(distance / 120.0)));
     emit_syn(state->uinput_mouse_fd);
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
+    auto *state = raw(input);
+    if (state->use_jni_input) {
+      jni::inject_key(static_cast<int>(modcode), !release);
+      return;
+    }
     auto it = vk_to_linux.find(modcode);
     if (it == vk_to_linux.end()) {
       BOOST_LOG(debug) << "android input: unmapped key code 0x"sv << std::hex << modcode << std::dec;
       return;
     }
-    auto *state = raw(input);
     emit(state->uinput_keyboard_fd, EV_KEY, it->second, release ? 0 : 1);
     emit_syn(state->uinput_keyboard_fd);
   }

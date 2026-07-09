@@ -1,0 +1,25 @@
+// IInputBridge.aidl
+// Interface exposed by the Shizuku UserService (running as shell) to the host app. The UserService
+// holds android.permission.INJECT_EVENTS (granted to the shell user) and synthesizes the actual
+// MotionEvent/KeyEvent objects — so every method executes in the shell process.
+package dev.lizardbyte.sunshine;
+
+interface IInputBridge {
+    /** Key press/release. vkCode is the Windows virtual-key code Moonlight sends. */
+    void injectKey(int vkCode, boolean pressed);
+
+    /** Relative mouse movement in raw screen pixels. */
+    void injectMouseMove(float dx, float dy);
+
+    /**
+     * Mouse button press/release.
+     * button: 1=left  2=right  4=middle  8=X1  16=X2  (matches Sunshine's BUTTON_* enum).
+     */
+    void injectMouseButton(int button, boolean pressed);
+
+    /** Vertical scroll, high-resolution 1/120-wheel-notch units (positive = up). */
+    void injectScroll(int distance);
+
+    /** Horizontal scroll, same units as injectScroll. */
+    void injectHScroll(int distance);
+}

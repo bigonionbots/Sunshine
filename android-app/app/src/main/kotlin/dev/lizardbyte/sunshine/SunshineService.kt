@@ -2,6 +2,8 @@ package dev.lizardbyte.sunshine
 
 import android.Manifest
 import android.app.Notification
+import android.content.ComponentName
+import android.content.ServiceConnection
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -25,6 +27,7 @@ import android.os.IBinder
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
+import rikka.shizuku.Shizuku
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -52,6 +55,27 @@ class SunshineService : Service() {
 
     private val encoderLock = Any()
     private var encoder: MediaCodecEncoder? = null
+
+    private var inputBridge: IInputBridge? = null
+    private val inputServiceArgs = Shizuku.UserServiceArgs(
+        ComponentName("dev.lizardbyte.sunshine", InputUserService::class.java.name))
+        .daemon(false)
+        .processNameSuffix("input")
+        .debuggable(false)
+        .version(1)
+    private val inputServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val bridge = IInputBridge.Stub.asInterface(binder)
+            inputBridge = bridge
+            SunshineNative.nativeSetInputBridge(bridge)
+            Log.i(TAG, "Shizuku input bridge connected")
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            inputBridge = null
+            SunshineNative.nativeSetInputBridge(null)
+            Log.i(TAG, "Shizuku input bridge disconnected")
+        }
+    }
 
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
@@ -154,11 +178,40 @@ class SunshineService : Service() {
         SunshineNative.nativeCaptureStarted(w, h)
         Log.i(TAG, "capture started ${w}x$h @ ${dpi}dpi")
 
-        // Offer MediaCodec hardware encode to the core. When a stream launches, the core calls back
-        // into startEncoder() and we point this VirtualDisplay at the encoder's input Surface.
+        // Offer MediaCodec hardware encode to the core.
         SunshineNative.nativeSetVideoBridge(this)
 
+        // Bind the Shizuku input UserService for non-root keyboard/mouse injection.
+        bindInputService()
+
         startAudioCapture(mp)
+    }
+
+    // --- Shizuku input bridge ----------------------------------------------------------------
+
+    private fun bindInputService() {
+        if (!Shizuku.pingBinder()) {
+            Log.w(TAG, "Shizuku not running; input will be unavailable on non-rooted device")
+            return
+        }
+        if (Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "Shizuku permission not granted; input unavailable")
+            return
+        }
+        try {
+            Shizuku.bindUserService(inputServiceArgs, inputServiceConnection)
+        } catch (e: Exception) {
+            Log.e(TAG, "bindUserService failed", e)
+        }
+    }
+
+    private fun unbindInputService() {
+        SunshineNative.nativeSetInputBridge(null)
+        inputBridge = null
+        try {
+            Shizuku.unbindUserService(inputServiceArgs, inputServiceConnection, true)
+        } catch (_: Exception) {
+        }
     }
 
     // --- MediaCodec bridge (called from native encoder threads) -------------------------------
@@ -304,6 +357,7 @@ class SunshineService : Service() {
     }
 
     private fun stopCapture() {
+        unbindInputService()
         SunshineNative.nativeSetVideoBridge(null)
         stopEncoder()
         stopAudioCapture()
