@@ -1,7 +1,9 @@
 package dev.lizardbyte.sunshine
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.view.Gravity
@@ -43,9 +45,29 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
+    /**
+     * Ensure RECORD_AUDIO (needed for AudioPlaybackCapture) is granted, then request the screen
+     * capture consent. Audio is optional: if the permission is denied we still start with video.
+     */
     private fun requestProjection() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_AUDIO)
+            return
+        }
+        requestProjectionConsent()
+    }
+
+    private fun requestProjectionConsent() {
         val mpm = getSystemService(MediaProjectionManager::class.java)
         startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_AUDIO) {
+            // Proceed regardless: audio capture is best-effort, screen capture is the priority.
+            requestProjectionConsent()
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -62,5 +84,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_PROJECTION = 1001
+        private const val REQ_AUDIO = 1002
     }
 }

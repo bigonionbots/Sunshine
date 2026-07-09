@@ -94,4 +94,34 @@ extern "C" {
       jni::push_frame(pixels, width, height, row_stride);
     }
   }
+
+  /**
+   * @brief Notify the core that AudioPlaybackCapture has started.
+   *
+   * @param sample_rate Source sample rate in hertz.
+   * @param channels Number of interleaved source channels.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeAudioStarted(JNIEnv *, jclass, jint sample_rate, jint channels) {
+    jni::audio_started(sample_rate, channels);
+  }
+
+  /**
+   * @brief Notify the core that AudioPlaybackCapture has stopped.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativeAudioStopped(JNIEnv *, jclass) {
+    jni::audio_stopped();
+  }
+
+  /**
+   * @brief Deliver interleaved float PCM captured by the app to the core.
+   *
+   * @param buffer Direct ByteBuffer holding the float samples.
+   * @param count Number of float samples (frames * source channels).
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativePushAudio(JNIEnv *env, jclass, jobject buffer, jint count) {
+    auto *samples = static_cast<const float *>(env->GetDirectBufferAddress(buffer));
+    if (samples) {
+      jni::push_audio(samples, count);
+    }
+  }
 }

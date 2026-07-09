@@ -1,14 +1,20 @@
 package dev.lizardbyte.sunshine
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -20,6 +26,8 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.math.max
 
@@ -38,6 +46,11 @@ class SunshineService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var captureThread: HandlerThread? = null
+
+    private var audioRecord: AudioRecord? = null
+    private var audioThread: Thread? = null
+    @Volatile
+    private var audioRunning = false
 
     override fun onCreate() {
         super.onCreate()
@@ -131,9 +144,91 @@ class SunshineService : Service() {
         )
         SunshineNative.nativeCaptureStarted(w, h)
         Log.i(TAG, "capture started ${w}x$h @ ${dpi}dpi")
+
+        startAudioCapture(mp)
+    }
+
+    /**
+     * Capture playback audio for the same MediaProjection session via AudioPlaybackCapture and
+     * push interleaved float PCM to the core. Best-effort: any failure leaves the host video-only.
+     */
+    private fun startAudioCapture(mp: MediaProjection) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "RECORD_AUDIO not granted; streaming without audio")
+            return
+        }
+
+        val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mp)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .build()
+        val format = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+            .setSampleRate(SAMPLE_RATE)
+            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+            .build()
+
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_FLOAT
+        )
+        val record = try {
+            AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(captureConfig)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(max(minBuf, SAMPLE_RATE * CHANNELS * 4 / 5))  // ~200ms
+                .build()
+        } catch (e: Exception) {
+            Log.e(TAG, "AudioRecord build failed; streaming without audio", e)
+            return
+        }
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord not initialized; streaming without audio")
+            record.release()
+            return
+        }
+
+        audioRecord = record
+        record.startRecording()
+        SunshineNative.nativeAudioStarted(SAMPLE_RATE, CHANNELS)
+        audioRunning = true
+        audioThread = thread(name = "sunshine-audio", isDaemon = true) {
+            // 10 ms interleaved-float chunks, delivered zero-copy via a direct ByteBuffer.
+            val floats = SAMPLE_RATE / 100 * CHANNELS
+            val direct = ByteBuffer.allocateDirect(floats * 4).order(ByteOrder.nativeOrder())
+            val fb = direct.asFloatBuffer()
+            val tmp = FloatArray(floats)
+            while (audioRunning) {
+                val n = record.read(tmp, 0, floats, AudioRecord.READ_BLOCKING)
+                if (n <= 0) {
+                    if (n == AudioRecord.ERROR_INVALID_OPERATION || n == AudioRecord.ERROR_DEAD_OBJECT) break
+                    continue
+                }
+                fb.clear()
+                fb.put(tmp, 0, n)
+                SunshineNative.nativePushAudio(direct, n)
+            }
+        }
+        Log.i(TAG, "audio capture started ${SAMPLE_RATE}Hz x$CHANNELS")
+    }
+
+    private fun stopAudioCapture() {
+        audioRunning = false
+        audioThread?.join(500)
+        audioThread = null
+        audioRecord?.let {
+            try {
+                it.stop()
+            } catch (_: Exception) {
+            }
+            it.release()
+        }
+        audioRecord = null
+        SunshineNative.nativeAudioStopped()
     }
 
     private fun stopCapture() {
+        stopAudioCapture()
         SunshineNative.nativeCaptureStopped()
         virtualDisplay?.release()
         virtualDisplay = null
@@ -169,7 +264,12 @@ class SunshineService : Service() {
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .build()
-        startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        // MEDIA_PROJECTION carries capture; MICROPHONE covers AudioPlaybackCapture's RECORD_AUDIO.
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        startForeground(NOTIF_ID, notification, type)
     }
 
     private fun extractAssets() {
@@ -202,5 +302,7 @@ class SunshineService : Service() {
         private const val NOTIF_ID = 1
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"
+        private const val SAMPLE_RATE = 48000  // Sunshine's Opus pipeline runs at 48 kHz.
+        private const val CHANNELS = 2  // AudioPlaybackCapture is captured as stereo.
     }
 }

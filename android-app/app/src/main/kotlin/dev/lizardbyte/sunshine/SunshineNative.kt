@@ -35,4 +35,20 @@ object SunshineNative {
      * Deliver one captured RGBA_8888 frame. [buffer] must be a direct ByteBuffer.
      */
     external fun nativePushFrame(buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int)
+
+    /**
+     * Notify the core that AudioPlaybackCapture has started at the given format.
+     */
+    external fun nativeAudioStarted(sampleRate: Int, channels: Int)
+
+    /**
+     * Notify the core that AudioPlaybackCapture has stopped.
+     */
+    external fun nativeAudioStopped()
+
+    /**
+     * Deliver interleaved float PCM captured from playback. [buffer] must be a direct ByteBuffer;
+     * [count] is the number of float samples it holds (frames * channels).
+     */
+    external fun nativePushAudio(buffer: java.nio.ByteBuffer, count: Int)
 }

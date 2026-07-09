@@ -114,4 +114,52 @@ namespace jni {
    * @return Copy status.
    */
   frame_status copy_latest_frame(std::uint8_t *dst, int expected_width, int expected_height, int dst_row_pitch);
+
+  // --- AudioPlaybackCapture audio (interleaved float PCM pushed from the app) ----------------
+
+  /**
+   * @brief Mark audio capture as active with the given source format (called from the app).
+   * @details The source is delivered as interleaved 32-bit float PCM. Sunshine always runs at
+   *          48 kHz, so `sample_rate` is expected to be 48000; `channels` is typically 2 (the
+   *          format AudioPlaybackCapture produces).
+   *
+   * @param sample_rate Source sample rate in hertz.
+   * @param channels Number of interleaved source channels.
+   */
+  void audio_started(int sample_rate, int channels);
+
+  /**
+   * @brief Mark audio capture as stopped and drop any buffered samples (called from the app).
+   */
+  void audio_stopped();
+
+  /**
+   * @brief Whether the app is currently delivering captured audio.
+   *
+   * @return True when AudioPlaybackCapture is active.
+   */
+  bool audio_active();
+
+  /**
+   * @brief Push interleaved float PCM captured by the app into the ring buffer.
+   *
+   * @param samples Pointer to interleaved float samples.
+   * @param count Number of float samples (frames * source channels).
+   */
+  void push_audio(const float *samples, int count);
+
+  /**
+   * @brief Drain exactly `frames` audio frames into `dst`, remapping to `out_channels`.
+   * @details Blocks up to `timeout_ms` for enough buffered samples. Source stereo is copied to
+   *          the first two output channels; extra output channels are zero-filled and mono is
+   *          the average of L/R. On timeout the destination is filled with silence so the audio
+   *          stream keeps flowing.
+   *
+   * @param dst Destination for interleaved float PCM (`frames * out_channels` samples).
+   * @param frames Number of audio frames requested.
+   * @param out_channels Number of output channels to produce.
+   * @param timeout_ms Maximum time to wait for buffered samples.
+   * @return True when real captured audio was written, false when silence was written.
+   */
+  bool read_audio(float *dst, int frames, int out_channels, int timeout_ms);
 }  // namespace jni

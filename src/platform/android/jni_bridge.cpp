@@ -5,8 +5,12 @@
  *          app lands, `set_vm()` will capture real handles and the getters will call into Java.
  */
 // standard includes
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -27,6 +31,15 @@ namespace jni {
     std::atomic<bool> g_capture_active {false};  ///< Whether the app is delivering frames.
     std::atomic<int> g_capture_w {0};  ///< Advertised capture width.
     std::atomic<int> g_capture_h {0};  ///< Advertised capture height.
+
+    std::mutex g_audio_mutex;  ///< Guards the audio ring buffer and format.
+    std::condition_variable g_audio_cv;  ///< Signals newly pushed audio samples.
+    std::deque<float> g_audio_buf;  ///< Interleaved float PCM awaiting consumption.
+    std::atomic<bool> g_audio_active {false};  ///< Whether the app is delivering audio.
+    int g_audio_channels = 2;  ///< Source channel count (guarded by g_audio_mutex).
+
+    /// Cap the backlog so a stalled consumer can't grow the buffer without bound (~0.5s stereo).
+    constexpr std::size_t k_audio_buf_max = 48000 * 2 / 2;
   }  // namespace
 
   void set_vm(void *vm, void *app_context) {
@@ -114,6 +127,84 @@ namespace jni {
       }
     }
     return frame_status::ok;
+  }
+
+  void audio_started(int sample_rate, int channels) {
+    (void) sample_rate;  // Sunshine always resamples/consumes at 48 kHz.
+    std::lock_guard<std::mutex> lock(g_audio_mutex);
+    g_audio_channels = channels > 0 ? channels : 2;
+    g_audio_buf.clear();
+    g_audio_active = true;
+  }
+
+  void audio_stopped() {
+    std::lock_guard<std::mutex> lock(g_audio_mutex);
+    g_audio_active = false;
+    g_audio_buf.clear();
+    g_audio_cv.notify_all();
+  }
+
+  bool audio_active() {
+    return g_audio_active.load();
+  }
+
+  void push_audio(const float *samples, int count) {
+    if (!samples || count <= 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_audio_mutex);
+    if (!g_audio_active) {
+      return;
+    }
+    // Drop the oldest samples if the consumer has fallen behind, keeping latency bounded.
+    if (g_audio_buf.size() + count > k_audio_buf_max) {
+      const std::size_t overflow = g_audio_buf.size() + count - k_audio_buf_max;
+      g_audio_buf.erase(g_audio_buf.begin(), g_audio_buf.begin() + std::min(overflow, g_audio_buf.size()));
+    }
+    g_audio_buf.insert(g_audio_buf.end(), samples, samples + count);
+    g_audio_cv.notify_one();
+  }
+
+  bool read_audio(float *dst, int frames, int out_channels, int timeout_ms) {
+    if (!dst || frames <= 0 || out_channels <= 0) {
+      return false;
+    }
+    std::unique_lock<std::mutex> lock(g_audio_mutex);
+    const int src_channels = g_audio_channels;
+    const std::size_t needed = static_cast<std::size_t>(frames) * src_channels;
+    const bool have = g_audio_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+      return !g_audio_active || g_audio_buf.size() >= needed;
+    });
+
+    if (!have || g_audio_buf.size() < needed) {
+      // Timed out or capture stopped: emit silence so the audio stream keeps flowing.
+      std::memset(dst, 0, static_cast<std::size_t>(frames) * out_channels * sizeof(float));
+      return false;
+    }
+
+    for (int f = 0; f < frames; ++f) {
+      float l = g_audio_buf.front();
+      g_audio_buf.pop_front();
+      float r = l;
+      for (int c = 1; c < src_channels; ++c) {
+        const float v = g_audio_buf.front();
+        g_audio_buf.pop_front();
+        if (c == 1) {
+          r = v;
+        }
+      }
+      float *out = dst + static_cast<std::size_t>(f) * out_channels;
+      if (out_channels == 1) {
+        out[0] = 0.5f * (l + r);
+      } else {
+        out[0] = l;
+        out[1] = r;
+        for (int c = 2; c < out_channels; ++c) {
+          out[c] = 0.0f;
+        }
+      }
+    }
+    return true;
   }
 
 }  // namespace jni
