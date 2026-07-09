@@ -129,6 +129,7 @@ namespace platf {
     std::vector<std::uint8_t> capture_buf;  ///< Reused buffer for raw screencap output.
 
     std::chrono::nanoseconds delay {std::chrono::milliseconds(16)};  ///< Per-frame interval from the client framerate.
+    bool pending_reinit {false};  ///< Set when the display resolution changed (e.g. rotation) and the pipeline must reinit.
 
     ~android_display_t() override {
       if (fb_mem && fb_mem != MAP_FAILED) {
@@ -189,6 +190,10 @@ namespace platf {
       std::size_t src_off = 0;
       fb_var_screeninfo var {};
       if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) == 0) {
+        if (static_cast<int>(var.xres) != width || static_cast<int>(var.yres) != height) {
+          pending_reinit = true;  // the screen was rotated/resized; reinit at the new dimensions
+          return false;
+        }
         src_off = static_cast<std::size_t>(var.yoffset) * fb_stride;
       }
       if (src_off + static_cast<std::size_t>(fb_stride) * height > fb_size) {
@@ -242,6 +247,7 @@ namespace platf {
         return false;
       }
       if (static_cast<int>(hdr.width) != img->width || static_cast<int>(hdr.height) != img->height) {
+        pending_reinit = true;  // the screen was rotated/resized; reinit at the new dimensions
         return false;
       }
       const std::uint8_t *src = capture_buf.data() + hdr.pixel_offset;
@@ -282,6 +288,9 @@ namespace platf {
         }
 
         bool ok = use_framebuffer ? grab_framebuffer(img.get()) : grab_screen(img.get());
+        if (pending_reinit) {
+          return capture_e::reinit;  // display resolution changed (e.g. rotation); rebuild the pipeline
+        }
         if (!ok) {
           dummy_img(img.get());  // fall back to black on any capture failure
         }
