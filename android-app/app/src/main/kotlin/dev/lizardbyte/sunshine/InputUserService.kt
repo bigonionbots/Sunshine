@@ -1,7 +1,9 @@
 package dev.lizardbyte.sunshine
 
+import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
+import java.io.FileOutputStream
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyCharacterMap
@@ -214,6 +216,25 @@ class InputUserService : IInputBridge.Stub() {
         }
 
         syn(fd)
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Screen capture (shell-privilege screencap for privacy mode)
+
+    override fun screencapToFd(fd: ParcelFileDescriptor) {
+        var proc: Process? = null
+        try {
+            proc = Runtime.getRuntime().exec("/system/bin/screencap")
+            FileOutputStream(fd.fileDescriptor).use { out ->
+                proc.inputStream.copyTo(out)
+            }
+            proc.waitFor()
+        } catch (e: Exception) {
+            Log.e(TAG, "screencapToFd: ${e.message}")
+        } finally {
+            proc?.destroy()
+            runCatching { fd.close() }
+        }
     }
 
     // -----------------------------------------------------------------------------------------

@@ -38,4 +38,12 @@ interface IInputBridge {
      * lt/rt: trigger values, 0.0..1.0.
      */
     void injectGamepadState(int slot, int buttons, float lsX, float lsY, float rsX, float rsY, float lt, float rt);
+
+    /**
+     * Run /system/bin/screencap (which requires shell or root) and write its raw binary output to
+     * the write end of a pipe. The caller must read from the read end concurrently (before calling
+     * this) to avoid blocking when the frame exceeds the pipe's 64 KB kernel buffer. The fd is
+     * closed before this method returns so the reader sees EOF.
+     */
+    void screencapToFd(in ParcelFileDescriptor fd);
 }

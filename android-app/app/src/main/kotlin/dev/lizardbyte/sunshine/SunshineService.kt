@@ -2,6 +2,7 @@ package dev.lizardbyte.sunshine
 
 import android.Manifest
 import android.app.Notification
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.ServiceConnection
 import android.app.NotificationChannel
@@ -20,10 +21,12 @@ import android.media.AudioRecord
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
@@ -35,10 +38,16 @@ import kotlin.concurrent.thread
 import kotlin.math.max
 
 /**
- * Foreground service that hosts the native Sunshine core and feeds it screen frames captured via
- * MediaProjection. It extracts the bundled web UI / apps.json into app storage (where the core
- * expects SUNSHINE_ASSETS_DIR / SUNSHINE_APPDATA), sets up a VirtualDisplay + ImageReader, pushes
- * each frame to the core over JNI, and runs the core on a dedicated thread.
+ * Foreground service that hosts the native Sunshine core and feeds it screen frames. Supports two
+ * capture modes selected by [PREF_SCREENCAP] in SharedPreferences:
+ *
+ * - **MediaProjection** (default): VirtualDisplay → ImageReader / MediaCodec surface. Requires
+ *   user consent each launch and shows a screen-recording indicator. Supports audio capture and
+ *   hardware H.265 encode.
+ *
+ * - **Screencap** (privacy mode): the native core's built-in `/system/bin/screencap` fallback.
+ *   No screen-recording indicator or consent dialog. Trade-offs: ~3–10 fps, software encode only,
+ *   no audio. FLAG_SECURE windows (password dialogs, banking apps) still appear black.
  */
 class SunshineService : Service() {
     @Volatile
@@ -62,7 +71,7 @@ class SunshineService : Service() {
         .daemon(false)
         .processNameSuffix("input")
         .debuggable(false)
-        .version(1)
+        .version(2)  // increment when IInputBridge AIDL changes to force UserService restart
     private val inputServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bridge = IInputBridge.Stub.asInterface(binder)
@@ -82,14 +91,20 @@ class SunshineService : Service() {
     @Volatile
     private var audioRunning = false
 
+    @Volatile
+    private var screencapRunning = false
+    private var screencapThread: Thread? = null
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // A mediaProjection foreground service must be started before the projection is used.
-        startForegroundCompat()
+        val screencapMode = getSharedPreferences("sunshine", MODE_PRIVATE)
+            .getBoolean(PREF_SCREENCAP, false)
+
+        startForegroundCompat(screencapMode)
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         val resultData: Intent? = if (Build.VERSION.SDK_INT >= 33) {
@@ -97,8 +112,11 @@ class SunshineService : Service() {
         } else {
             @Suppress("DEPRECATION") intent?.getParcelableExtra(EXTRA_RESULT_DATA)
         }
-        if (projection == null && resultCode != 0 && resultData != null) {
+
+        if (!screencapMode && projection == null && resultCode != 0 && resultData != null) {
             startCapture(resultCode, resultData)
+        } else if (screencapMode) {
+            startScreencapCapture()
         }
 
         if (!coreStarted) {
@@ -341,6 +359,109 @@ class SunshineService : Service() {
         Log.i(TAG, "audio capture started ${SAMPLE_RATE}Hz x$CHANNELS")
     }
 
+    /**
+     * Start a screencap loop for privacy mode. [InputUserService] runs `/system/bin/screencap`
+     * as shell (uid 2000) and writes the raw binary output through a pipe. A concurrent reader
+     * thread drains the pipe to prevent the writer from blocking on the 64 KB kernel pipe buffer
+     * (a full 1080p RGBA frame is ~8 MB). Parsed frames are pushed to the native core via
+     * [SunshineNative.nativePushFrame] using the same `use_jni_capture` path as MediaProjection.
+     */
+    private fun startScreencapCapture() {
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
+        val w = dm.widthPixels
+        val h = dm.heightPixels
+        // Announce capture before nativeStart() so platf::display() sees capture_active() == true
+        // and takes the use_jni_capture path rather than falling back to popen(screencap) as
+        // app UID (which fails — screencap requires shell or root).
+        SunshineNative.nativeCaptureStarted(w, h)
+        Log.i(TAG, "screencap mode: capture announced ${w}x${h}")
+        bindInputService()
+
+        screencapRunning = true
+        val initW = w
+        val initH = h
+        screencapThread = thread(name = "sunshine-screencap", isDaemon = true) {
+            var directBuf = ByteBuffer.allocateDirect(initW * initH * 4)
+            // Track what we announced to nativeCaptureStarted so we can update it when the
+            // actual screencap dimensions differ (e.g. navigation bar, display cutout rounding).
+            var announcedW = initW
+            var announcedH = initH
+            while (screencapRunning) {
+                val bridge = inputBridge
+                if (bridge == null) {
+                    // Shizuku binds asynchronously; wait for the bridge before capturing.
+                    try { Thread.sleep(100) } catch (_: InterruptedException) { break }
+                    continue
+                }
+                try {
+                    val pipe = ParcelFileDescriptor.createPipe()
+                    val readFd = pipe[0]
+                    val writeFd = pipe[1]
+
+                    // Read from the pipe on a separate thread to prevent the writer from blocking
+                    // when screencap output exceeds the kernel pipe buffer (~64 KB). The writer
+                    // (InputUserService.screencapToFd) runs synchronously over Binder — it would
+                    // deadlock if nothing is draining the pipe.
+                    var raw = ByteArray(0)
+                    val reader = thread(isDaemon = true) {
+                        ParcelFileDescriptor.AutoCloseInputStream(readFd).use { raw = it.readBytes() }
+                    }
+
+                    try {
+                        bridge.screencapToFd(writeFd)
+                    } finally {
+                        writeFd.close()  // signal EOF; InputUserService already closed its dup
+                    }
+                    reader.join()
+
+                    if (raw.size < 12) {
+                        Log.w(TAG, "screencap: output too short (${raw.size} bytes)")
+                        Thread.sleep(300)
+                        continue
+                    }
+                    val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                    val capW = hdr.getInt(0)
+                    val capH = hdr.getInt(4)
+                    val pixelBytes = capW * capH * 4
+                    val pixelOffset = when {
+                        raw.size == 12 + pixelBytes -> 12
+                        raw.size == 16 + pixelBytes -> 16  // newer Android prepends a dataspace field
+                        else -> {
+                            Log.w(TAG, "screencap: unexpected size ${raw.size} for ${capW}x${capH}")
+                            Thread.sleep(300)
+                            continue
+                        }
+                    }
+
+                    // If the actual screencap dimensions differ from what we pre-announced, update
+                    // nativeCaptureStarted() so the native core uses the correct size on the next
+                    // reinit. The first frame with wrong dims will trigger a reinit via resize;
+                    // after that the dims match and content flows through correctly.
+                    if (capW != announcedW || capH != announcedH) {
+                        Log.w(TAG, "screencap: actual dims ${capW}x${capH} differ from announced ${announcedW}x${announcedH}; updating")
+                        SunshineNative.nativeCaptureStarted(capW, capH)
+                        announcedW = capW
+                        announcedH = capH
+                    }
+
+                    if (directBuf.capacity() < pixelBytes) {
+                        directBuf = ByteBuffer.allocateDirect(pixelBytes)
+                    }
+                    directBuf.clear()
+                    directBuf.put(raw, pixelOffset, pixelBytes)
+                    SunshineNative.nativePushFrame(directBuf, capW, capH, capW * 4)
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    if (screencapRunning) Log.e(TAG, "screencap: ${e.message}")
+                    try { Thread.sleep(300) } catch (_: InterruptedException) { break }
+                }
+            }
+        }
+    }
+
     private fun stopAudioCapture() {
         audioRunning = false
         audioThread?.join(500)
@@ -357,6 +478,10 @@ class SunshineService : Service() {
     }
 
     private fun stopCapture() {
+        screencapRunning = false
+        screencapThread?.interrupt()
+        screencapThread?.join(1000)
+        screencapThread = null
         unbindInputService()
         SunshineNative.nativeSetVideoBridge(null)
         stopEncoder()
@@ -389,19 +514,41 @@ class SunshineService : Service() {
         )
     }
 
-    private fun startForegroundCompat() {
+    private fun startForegroundCompat(screencapMode: Boolean) {
+        // Tapping the notification opens the Sunshine web UI in the default browser.
+        val webIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://localhost:47990")),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val modeText = if (screencapMode) "Privacy mode (screencap)" else "MediaProjection capture"
         val notification: Notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle("Sunshine")
-            .setContentText("Streaming host running")
+            .setContentTitle("Sunshine is running")
+            .setContentText(modeText)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
+            .setContentIntent(webIntent)
+            .addAction(
+                Notification.Action.Builder(
+                    null,
+                    "Open Settings",
+                    webIntent
+                ).build()
+            )
             .build()
-        // MEDIA_PROJECTION carries capture; MICROPHONE covers AudioPlaybackCapture's RECORD_AUDIO.
-        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+
+        if (screencapMode) {
+            // Screencap mode: no MediaProjection, no microphone capture. Use dataSync type so the
+            // foreground service is valid on Android 14+ without a MediaProjection token.
+            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            startForeground(NOTIF_ID, notification, type)
         }
-        startForeground(NOTIF_ID, notification, type)
     }
 
     private fun extractAssets() {
@@ -434,6 +581,8 @@ class SunshineService : Service() {
         private const val NOTIF_ID = 1
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"
+        /** SharedPreferences key: true = use screencap fallback instead of MediaProjection. */
+        const val PREF_SCREENCAP = "screencap_mode"
         private const val SAMPLE_RATE = 48000  // Sunshine's Opus pipeline runs at 48 kHz.
         private const val CHANNELS = 2  // AudioPlaybackCapture is captured as stereo.
     }

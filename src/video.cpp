@@ -3107,14 +3107,22 @@ namespace video {
   int validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
 #ifdef __ANDROID__
     if (encoder.name == "mediacodec") {
-      // MediaCodec can't be exercised at startup: it needs the app's input Surface, which only
-      // exists once a stream launches. Assume standard, VUI-compliant H.264/HEVC output and defer
-      // real capability to stream start (where a failure falls back to software). AV1 encode is
-      // unavailable on virtually all mobile MediaCodec encoders, so don't advertise it.
       (void) disp;
+      // AV1 is unavailable on virtually all mobile MediaCodec encoders.
       if (config.videoFormat == 2) {
         return -1;
       }
+      // If the app has not registered a MediaCodec bridge (screencap/privacy mode, or headless),
+      // fail the probe here so the software encoder is selected instead. In MediaProjection mode
+      // the bridge is registered via nativeSetVideoBridge() before nativeStart(), so this check
+      // is reliable at probe time. The infinite-retry loop that results from choosing mediacodec
+      // without a bridge (each session attempt fails and restarts) is avoided by rejecting it now.
+      if (!jni::video_encoder_available()) {
+        return -1;
+      }
+      // MediaCodec can't be exercised at startup: the input Surface only exists once a stream
+      // launches. Assume VUI-compliant H.264/HEVC output; real capability is deferred to stream
+      // start where a failure falls back to software.
       return VUI_PARAMS;
     }
 #endif

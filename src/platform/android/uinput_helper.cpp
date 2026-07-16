@@ -70,7 +70,9 @@ extern "C" {
     }
     uinput_user_dev uud {};
     std::strncpy(uud.name, "Sunshine Keyboard", UINPUT_MAX_NAME_SIZE - 1);
-    uud.id.bustype = BUS_USB;
+    // BUS_VIRTUAL prevents Android's EventHub from classifying this as an external hard keyboard,
+    // which would otherwise suppress the soft keyboard (IME) when text fields are focused.
+    uud.id.bustype = BUS_VIRTUAL;
     uud.id.vendor = 0x1209;
     uud.id.product = 0x0002;
     uud.id.version = 1;

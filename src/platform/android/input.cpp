@@ -102,10 +102,11 @@ namespace platf {
      * @param name Human-readable device name.
      * @param product USB product id used to distinguish the virtual devices.
      * @param setup Callback that enables the required event/code bits on the fd.
+     * @param bustype BUS_USB for external-class devices, BUS_VIRTUAL for internal-class devices.
      * @return Open uinput fd on success, or -1 on failure.
      */
     template<class FN>
-    int create_uinput(const char *name, std::uint16_t product, FN &&setup) {
+    int create_uinput(const char *name, std::uint16_t product, FN &&setup, std::uint16_t bustype = BUS_USB) {
       int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
       if (fd < 0) {
         BOOST_LOG(warning) << "android input: cannot open /dev/uinput ("sv << std::strerror(errno)
@@ -117,7 +118,7 @@ namespace platf {
 
       uinput_user_dev uud {};
       std::strncpy(uud.name, name, UINPUT_MAX_NAME_SIZE - 1);
-      uud.id.bustype = BUS_USB;
+      uud.id.bustype = bustype;
       uud.id.vendor = 0x1209;  // pid.codes open-source VID
       uud.id.product = product;
       uud.id.version = 1;
@@ -155,12 +156,15 @@ namespace platf {
   }
 
   int android_create_uinput_keyboard() {
+    // BUS_VIRTUAL: Android's EventHub only classifies BUS_USB and BUS_BLUETOOTH devices as
+    // "external", and only external alphabetic keyboards suppress the IME. Using BUS_VIRTUAL
+    // keeps the device "internal" so the soft keyboard still appears when text fields are focused.
     return create_uinput("Sunshine Keyboard", 0x0002, [](int fd) {
       ioctl(fd, UI_SET_EVBIT, EV_KEY);
       for (const auto &[vk, key] : vk_to_linux) {
         ioctl(fd, UI_SET_KEYBIT, key);
       }
-    });
+    }, BUS_VIRTUAL);
   }
 
   void freeInput(void *p) {

@@ -104,6 +104,12 @@ namespace platf {
        * @return A sink_t naming the implicit device output.
        */
       std::optional<sink_t> sink_info() override {
+        // In screencap/privacy mode the app never calls nativeAudioStarted(), so no real audio
+        // is available. Returning nullopt tells the pipeline "there will be no audio" and stops
+        // it from sending silence packets that compete with video for bandwidth.
+        if (!jni::audio_active()) {
+          return std::nullopt;
+        }
         sink_t sink;
         sink.host = "android-playback";
         return sink;
