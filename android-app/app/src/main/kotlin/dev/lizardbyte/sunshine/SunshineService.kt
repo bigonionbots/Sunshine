@@ -71,7 +71,7 @@ class SunshineService : Service() {
         .daemon(false)
         .processNameSuffix("input")
         .debuggable(false)
-        .version(3)  // increment when IInputBridge AIDL changes to force UserService restart
+        .version(4)  // increment when IInputBridge AIDL changes to force UserService restart
     private val inputServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bridge = IInputBridge.Stub.asInterface(binder)
@@ -94,6 +94,8 @@ class SunshineService : Service() {
     @Volatile
     private var screencapRunning = false
     private var screencapThread: Thread? = null
+    @Volatile
+    private var daemonReadPfd: ParcelFileDescriptor? = null  // held open while daemon runs
 
     override fun onCreate() {
         super.onCreate()
@@ -360,138 +362,166 @@ class SunshineService : Service() {
     }
 
     /**
-     * Start a screencap loop for privacy mode. [InputUserService] runs `/system/bin/screencap`
-     * as shell (uid 2000) and writes the raw binary output through a pipe. A concurrent reader
-     * thread drains the pipe to prevent the writer from blocking on the 64 KB kernel pipe buffer
-     * (a full 1080p RGBA frame is ~8 MB). Parsed frames are pushed to the native core via
-     * [SunshineNative.nativePushFrame] using the same `use_jni_capture` path as MediaProjection.
+     * Start screencap capture for privacy mode.
+     *
+     * Tries SurfaceControl reflection first (BGRA, no subprocess per frame). If reflection is
+     * unavailable on this device, falls through to [runScreencapDaemon] which starts a persistent
+     * native thread in the Shizuku UserService process that loops /system/bin/screencap and
+     * streams RGBA frames over a single pipe — eliminating the per-frame process-spawn and
+     * per-frame Binder round-trip that limited the subprocess path to ~27 fps.
      */
     private fun startScreencapCapture() {
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val dm = DisplayMetrics()
         @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        // Announce capture before nativeStart() so platf::display() sees capture_active() == true
-        // and takes the use_jni_capture path rather than falling back to popen(screencap) as
-        // app UID (which fails — screencap requires shell or root).
-        SunshineNative.nativeCaptureStarted(w, h)
-        Log.i(TAG, "screencap mode: capture announced ${w}x${h}")
+        val initW = dm.widthPixels
+        val initH = dm.heightPixels
+        // Announce capture before nativeStart() so the native core's display() sees
+        // capture_active() == true and takes the JNI path instead of trying popen(screencap)
+        // as app UID (which fails — screencap requires shell or root).
+        SunshineNative.nativeCaptureStarted(initW, initH)
+        Log.i(TAG, "screencap mode: capture announced ${initW}x${initH}")
         bindInputService()
 
         screencapRunning = true
-        val initW = w
-        val initH = h
         screencapThread = thread(name = "sunshine-screencap", isDaemon = true) {
             var directBuf = ByteBuffer.allocateDirect(initW * initH * 4)
-            // Track what we announced to nativeCaptureStarted so we can update it when the
-            // actual screencap dimensions differ (e.g. navigation bar, display cutout rounding).
             var announcedW = initW
             var announcedH = initH
-            // Start with the BGRA reflection path; flip to false if UserService returns empty.
-            var bgraCaptureFailed = false
-            while (screencapRunning) {
+
+            // ── Phase 1: per-frame BGRA reflection loop ───────────────────────
+            // Runs until SurfaceControl reflection is confirmed unavailable, at which point
+            // we fall through to the persistent daemon (Phase 2).
+            var reflectionFailed = false
+            while (screencapRunning && !reflectionFailed) {
                 val bridge = inputBridge
                 if (bridge == null) {
-                    // Shizuku binds asynchronously; wait for the bridge before capturing.
-                    try { Thread.sleep(100) } catch (_: InterruptedException) { break }
+                    try { Thread.sleep(100) } catch (_: InterruptedException) { return@thread }
                     continue
                 }
                 try {
                     val pipe = ParcelFileDescriptor.createPipe()
                     val readFd = pipe[0]
                     val writeFd = pipe[1]
-
-                    // Read from the pipe on a separate thread to prevent the writer from blocking
-                    // when output exceeds the kernel pipe buffer (~64 KB). The writer runs
-                    // synchronously over Binder and would deadlock if nothing drains the pipe.
                     var raw = ByteArray(0)
+                    // Drain the pipe concurrently; the Binder call blocks until screencap finishes
+                    // and the whole frame is written, but the kernel pipe buffer is only ~64 KB.
                     val reader = thread(isDaemon = true) {
                         ParcelFileDescriptor.AutoCloseInputStream(readFd).use { raw = it.readBytes() }
                     }
-
-                    // Prefer the BGRA reflection path (no subprocess); fall back to screencapToFd
-                    // if the UserService returned empty (reflection unsupported on this device).
-                    val isBgra = !bgraCaptureFailed
                     try {
-                        if (isBgra) bridge.screencapToFdBGRA(writeFd, announcedW, announcedH)
-                        else bridge.screencapToFd(writeFd)
+                        bridge.screencapToFdBGRA(writeFd, announcedW, announcedH)
                     } finally {
-                        writeFd.close()  // signal EOF; UserService already closed its dup
+                        writeFd.close()
                     }
                     reader.join()
 
-                    if (isBgra && raw.size < 8) {
-                        // Empty response: SurfaceControl reflection not available on this device.
-                        Log.w(TAG, "screencap BGRA: reflection unavailable, switching to subprocess")
-                        bgraCaptureFailed = true
-                        Thread.sleep(100)
+                    if (raw.size < 8) {
+                        Log.w(TAG, "screencap: BGRA reflection unavailable, switching to daemon")
+                        reflectionFailed = true
+                        break
+                    }
+                    val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                    val capW = hdr.getInt(0)
+                    val capH = hdr.getInt(4)
+                    val pixelBytes = capW * capH * 4
+                    if (raw.size != 8 + pixelBytes || capW <= 0 || capH <= 0) {
+                        Log.w(TAG, "screencap BGRA: bad frame size ${raw.size} for ${capW}x${capH}")
+                        try { Thread.sleep(300) } catch (_: InterruptedException) { return@thread }
                         continue
                     }
-
-                    val capW: Int
-                    val capH: Int
-                    val pixelBytes: Int
-                    val pixelOffset: Int
-
-                    if (isBgra) {
-                        val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-                        capW = hdr.getInt(0)
-                        capH = hdr.getInt(4)
-                        pixelBytes = capW * capH * 4
-                        pixelOffset = 8
-                        if (raw.size != pixelOffset + pixelBytes) {
-                            Log.w(TAG, "screencap BGRA: unexpected size ${raw.size} for ${capW}x${capH}")
-                            Thread.sleep(300)
-                            continue
-                        }
-                    } else {
-                        if (raw.size < 12) {
-                            Log.w(TAG, "screencap: output too short (${raw.size} bytes)")
-                            Thread.sleep(300)
-                            continue
-                        }
-                        val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-                        capW = hdr.getInt(0)
-                        capH = hdr.getInt(4)
-                        pixelBytes = capW * capH * 4
-                        pixelOffset = when {
-                            raw.size == 12 + pixelBytes -> 12
-                            raw.size == 16 + pixelBytes -> 16  // newer Android: dataspace field
-                            else -> {
-                                Log.w(TAG, "screencap: unexpected size ${raw.size} for ${capW}x${capH}")
-                                Thread.sleep(300)
-                                continue
-                            }
-                        }
-                    }
-
-                    // If the actual screencap dimensions differ from what we pre-announced, update
-                    // nativeCaptureStarted() so the native core uses the correct size on the next
-                    // reinit. The first frame with wrong dims will trigger a reinit via resize;
-                    // after that the dims match and content flows through correctly.
                     if (capW != announcedW || capH != announcedH) {
-                        Log.w(TAG, "screencap: actual dims ${capW}x${capH} differ from announced ${announcedW}x${announcedH}; updating")
+                        Log.w(TAG, "screencap: dims ${capW}x${capH} differ from announced ${announcedW}x${announcedH}")
                         SunshineNative.nativeCaptureStarted(capW, capH)
-                        announcedW = capW
-                        announcedH = capH
+                        announcedW = capW; announcedH = capH
                     }
-
-                    if (directBuf.capacity() < pixelBytes) {
-                        directBuf = ByteBuffer.allocateDirect(pixelBytes)
-                    }
-                    directBuf.clear()
-                    directBuf.put(raw, pixelOffset, pixelBytes)
-                    if (isBgra) SunshineNative.nativePushFrameBGRA(directBuf, capW, capH, capW * 4)
-                    else SunshineNative.nativePushFrame(directBuf, capW, capH, capW * 4)
+                    if (directBuf.capacity() < pixelBytes) directBuf = ByteBuffer.allocateDirect(pixelBytes)
+                    directBuf.clear(); directBuf.put(raw, 8, pixelBytes)
+                    SunshineNative.nativePushFrameBGRA(directBuf, capW, capH, capW * 4)
                 } catch (e: InterruptedException) {
-                    break
+                    return@thread
                 } catch (e: Exception) {
-                    if (screencapRunning) Log.e(TAG, "screencap: ${e.message}")
-                    try { Thread.sleep(300) } catch (_: InterruptedException) { break }
+                    if (screencapRunning) Log.e(TAG, "screencap BGRA: ${e.message}")
+                    try { Thread.sleep(300) } catch (_: InterruptedException) { return@thread }
                 }
             }
+
+            // ── Phase 2: persistent native screencap daemon ───────────────────
+            if (!screencapRunning || !reflectionFailed) return@thread
+            val bridge = inputBridge ?: return@thread
+            runScreencapDaemon(bridge, initW, initH, announcedW, announcedH, directBuf)
         }
+    }
+
+    /**
+     * Start the native screencap daemon and read frames from it until [screencapRunning] is false.
+     * Frames arrive as [width:int32 LE][height:int32 LE][RGBA pixels] and are forwarded to the
+     * native core via [SunshineNative.nativePushFrame].
+     */
+    private fun runScreencapDaemon(
+        bridge: IInputBridge,
+        initW: Int, initH: Int,
+        startAnnouncedW: Int, startAnnouncedH: Int,
+        startDirectBuf: ByteBuffer
+    ) {
+        var announcedW = startAnnouncedW
+        var announcedH = startAnnouncedH
+        var directBuf = startDirectBuf
+
+        val pipe = ParcelFileDescriptor.createPipe()
+        daemonReadPfd = pipe[0]
+        try {
+            bridge.startScreencapDaemon(pipe[1])
+        } catch (e: Exception) {
+            Log.e(TAG, "startScreencapDaemon failed: ${e.message}")
+            runCatching { daemonReadPfd?.close() }; daemonReadPfd = null
+            runCatching { pipe[1].close() }
+            return
+        } finally {
+            runCatching { pipe[1].close() }  // UserService now owns the write end via detachFd
+        }
+        Log.i(TAG, "screencap daemon started")
+
+        val headerBuf = ByteArray(8)
+        var pixelBuf = ByteArray(initW * initH * 4)
+        try {
+            val stream = java.io.FileInputStream(daemonReadPfd!!.fileDescriptor)
+            while (screencapRunning) {
+                if (!readFully(stream, headerBuf, 8)) break
+                val capW = ByteBuffer.wrap(headerBuf).order(ByteOrder.LITTLE_ENDIAN).getInt(0)
+                val capH = ByteBuffer.wrap(headerBuf).order(ByteOrder.LITTLE_ENDIAN).getInt(4)
+                if (capW <= 0 || capH <= 0 || capW > 8192 || capH > 8192) continue
+                val pixelBytes = capW * capH * 4
+                if (pixelBuf.size < pixelBytes) pixelBuf = ByteArray(pixelBytes)
+                if (!readFully(stream, pixelBuf, pixelBytes)) break
+                if (capW != announcedW || capH != announcedH) {
+                    Log.w(TAG, "screencap daemon: dims ${capW}x${capH} differ from ${announcedW}x${announcedH}")
+                    SunshineNative.nativeCaptureStarted(capW, capH)
+                    announcedW = capW; announcedH = capH
+                }
+                if (directBuf.capacity() < pixelBytes) directBuf = ByteBuffer.allocateDirect(pixelBytes)
+                directBuf.clear(); directBuf.put(pixelBuf, 0, pixelBytes)
+                // screencap outputs RGBA_8888; push_frame does the R/B swap to BGRA.
+                SunshineNative.nativePushFrame(directBuf, capW, capH, capW * 4)
+            }
+        } catch (e: Exception) {
+            if (screencapRunning) Log.e(TAG, "screencap daemon reader: ${e.message}")
+        } finally {
+            runCatching { daemonReadPfd?.close() }
+            daemonReadPfd = null
+        }
+        Log.i(TAG, "screencap daemon reader exited")
+    }
+
+    /** Read exactly [len] bytes from [stream] into [buf]; returns false on EOF or error. */
+    private fun readFully(stream: java.io.InputStream, buf: ByteArray, len: Int): Boolean {
+        var off = 0
+        while (off < len) {
+            val n = stream.read(buf, off, len - off)
+            if (n < 0) return false
+            off += n
+        }
+        return true
     }
 
     private fun stopAudioCapture() {
@@ -511,6 +541,10 @@ class SunshineService : Service() {
 
     private fun stopCapture() {
         screencapRunning = false
+        // Signal the daemon to stop and break any blocked read in the reader thread by closing
+        // the read-end of the pipe. Must happen before join() so we don't deadlock.
+        runCatching { inputBridge?.stopScreencapDaemon() }
+        daemonReadPfd?.close(); daemonReadPfd = null
         screencapThread?.interrupt()
         screencapThread?.join(1000)
         screencapThread = null

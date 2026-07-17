@@ -241,6 +241,21 @@ class InputUserService : IInputBridge.Stub() {
         }
     }
 
+    override fun startScreencapDaemon(fd: ParcelFileDescriptor) {
+        // detachFd() transfers ownership of the underlying file descriptor to the native daemon
+        // thread, which closes it on exit. Do not close fd after detachFd().
+        try {
+            SunshineInputNative.nativeStartScreencapDaemon(fd.detachFd())
+        } catch (e: Exception) {
+            Log.e(TAG, "startScreencapDaemon: ${e.message}")
+            runCatching { fd.close() }
+        }
+    }
+
+    override fun stopScreencapDaemon() {
+        SunshineInputNative.nativeStopScreencapDaemon()
+    }
+
     // Pre-allocated pixel storage reused across frames to avoid per-frame GC pressure.
     @Volatile private var capturePixelBuf: ByteArray? = null
     // Whether SurfaceControl reflection has been tested on this device (null = not yet).

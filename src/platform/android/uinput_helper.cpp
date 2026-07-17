@@ -1,11 +1,14 @@
 /**
  * @file src/platform/android/uinput_helper.cpp
- * @brief Tiny JNI library (libsunshine_input.so) for uinput device lifecycle.
+ * @brief Tiny JNI library (libsunshine_input.so) for uinput device lifecycle and screencap daemon.
  * @details Loaded by the Shizuku UserService running as shell so it can open /dev/uinput and
- *          create real kernel input devices (mouse cursor visible, gamepad recognized by games).
- *          Intentionally has NO dependency on libsunshine.so or its heavy static initializers.
+ *          create real kernel input devices (mouse cursor visible, gamepad recognized by games),
+ *          and run a persistent screencap loop that streams raw frames over a pipe without
+ *          spawning a new process per frame. Intentionally has NO dependency on libsunshine.so
+ *          or its heavy static initializers.
  */
 // standard includes
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,10 +19,151 @@
 #include <jni.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+// ---------------------------------------------------------------------------
+// Persistent screencap daemon
+// ---------------------------------------------------------------------------
+
+namespace {
+  std::atomic<bool> g_daemon_stop {false};  ///< Set true to signal the daemon to exit.
+  pthread_t g_daemon_thread {};             ///< Handle to the running daemon thread (or 0).
+  std::atomic<bool> g_daemon_running {false};  ///< True while the thread is alive.
+
+  // Transfer buffer between screencap stdout and the write-fd; lives in BSS.
+  static const std::size_t COPY_BUF_SIZE = 65536;
+  static std::uint8_t g_copy_buf[COPY_BUF_SIZE];
+
+  /**
+   * @brief Daemon thread: loop popen(screencap) and stream RGBA frames to a pipe.
+   * @details Each frame is prefixed by an 8-byte header [width(LE-int32), height(LE-int32)]
+   *          followed by width*height*4 raw RGBA_8888 bytes from screencap.  The loop runs
+   *          until g_daemon_stop is set or a write to the pipe fails (broken pipe).
+   *
+   * @param arg Write-end fd (as intptr_t).
+   * @return Always nullptr.
+   */
+  void *screencap_daemon_func(void *arg) {
+    int write_fd = static_cast<int>(reinterpret_cast<std::intptr_t>(arg));
+
+    // Ignore SIGPIPE so write() returns EPIPE instead of killing the process when the
+    // read-end of the pipe is closed by the SunshineService.
+    signal(SIGPIPE, SIG_IGN);
+
+    while (!g_daemon_stop.load(std::memory_order_relaxed)) {
+      FILE *f = popen("/system/bin/screencap", "r");
+      if (!f) {
+        continue;
+      }
+
+      // Read 16 bytes: on Android 12+ screencap writes [uint32 w, uint32 h, uint32 format,
+      // uint32 colorspace]; on older versions it writes [uint32 format, uint32 w, uint32 h].
+      // We always treat bytes 0-3 as width and 4-7 as height, matching the Kotlin reader.
+      std::uint8_t sc_hdr[16];
+      std::size_t hdr_read = std::fread(sc_hdr, 1, 16, f);
+      if (hdr_read < 8) {
+        pclose(f);
+        continue;
+      }
+
+      std::uint32_t cap_w, cap_h;
+      std::memcpy(&cap_w, sc_hdr + 0, 4);
+      std::memcpy(&cap_h, sc_hdr + 4, 4);
+
+      if (cap_w == 0 || cap_h == 0 || cap_w > 8192 || cap_h > 8192) {
+        pclose(f);
+        continue;
+      }
+
+      std::size_t pixel_bytes = static_cast<std::size_t>(cap_w) * cap_h * 4;
+
+      // Write our compact 8-byte header to the pipe.
+      std::uint8_t out_hdr[8];
+      std::memcpy(out_hdr + 0, &cap_w, 4);
+      std::memcpy(out_hdr + 4, &cap_h, 4);
+      {
+        const std::uint8_t *p = out_hdr;
+        std::size_t rem = 8;
+        while (rem > 0) {
+          ssize_t nw = write(write_fd, p, rem);
+          if (nw <= 0) { pclose(f); f = nullptr; break; }
+          p += nw; rem -= static_cast<std::size_t>(nw);
+        }
+      }
+      if (!f) { break; }  // write error: pipe closed on reader side
+
+      // Stream pixel data from screencap stdout to the write-fd in chunks.
+      std::size_t remaining = pixel_bytes;
+      bool write_ok = true;
+      while (remaining > 0 && !g_daemon_stop.load(std::memory_order_relaxed)) {
+        std::size_t to_read = remaining < COPY_BUF_SIZE ? remaining : COPY_BUF_SIZE;
+        std::size_t nr = std::fread(g_copy_buf, 1, to_read, f);
+        if (nr == 0) { break; }
+        const std::uint8_t *p = g_copy_buf;
+        std::size_t nw_rem = nr;
+        while (nw_rem > 0) {
+          ssize_t nw = write(write_fd, p, nw_rem);
+          if (nw <= 0) { write_ok = false; break; }
+          p += nw; nw_rem -= static_cast<std::size_t>(nw);
+        }
+        if (!write_ok) { break; }
+        remaining -= nr;
+      }
+      pclose(f);
+      if (!write_ok) { break; }
+    }
+
+    close(write_fd);
+    g_daemon_running.store(false);
+    return nullptr;
+  }
+}  // namespace
+
 extern "C" {
+
+  /**
+   * @brief Start the persistent screencap daemon thread.
+   * @details Stops any previously running daemon, then launches a new thread that continuously
+   *          runs /system/bin/screencap and streams RGBA frames to [write_fd].  The fd is
+   *          owned by the thread after this call returns; the caller must not close it.
+   *
+   * @param write_fd Write-end of a pipe created by the caller; ownership transferred to daemon.
+   */
+  JNIEXPORT void JNICALL
+  Java_dev_lizardbyte_sunshine_SunshineInputNative_nativeStartScreencapDaemon(JNIEnv *, jclass, jint write_fd) {
+    // Stop any existing daemon and wait for it to exit.
+    if (g_daemon_running.load()) {
+      g_daemon_stop.store(true);
+      pthread_join(g_daemon_thread, nullptr);
+      g_daemon_thread = {};
+    }
+    g_daemon_stop.store(false);
+    g_daemon_running.store(true);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    if (pthread_create(&g_daemon_thread, &attr,
+                       screencap_daemon_func,
+                       reinterpret_cast<void *>(static_cast<std::intptr_t>(static_cast<int>(write_fd)))) != 0) {
+      g_daemon_running.store(false);
+      close(write_fd);
+    }
+    pthread_attr_destroy(&attr);
+  }
+
+  /**
+   * @brief Signal the screencap daemon to stop after its current frame.
+   * @details Returns immediately; the daemon thread exits asynchronously once the in-progress
+   *          screencap process finishes.  Closing the read-end of the pipe also forces exit.
+   */
+  JNIEXPORT void JNICALL
+  Java_dev_lizardbyte_sunshine_SunshineInputNative_nativeStopScreencapDaemon(JNIEnv *, jclass) {
+    g_daemon_stop.store(true);
+  }
 
   /**
    * @brief Create a uinput virtual mouse with relative axes and all standard buttons.

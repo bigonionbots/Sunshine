@@ -52,8 +52,20 @@ interface IInputBridge {
      * On success writes {width:int, height:int} (8 bytes, little-endian) followed by
      * BGRA_8888 pixels (width × height × 4 bytes) to [fd]. On failure (reflection not
      * available on this device) writes nothing and closes [fd] immediately; the caller
-     * should detect the empty read and fall back to screencapToFd().
+     * should detect the empty read and fall back to startScreencapDaemon().
      * width/height: requested output resolution (compositor scales on the GPU).
      */
     void screencapToFdBGRA(in ParcelFileDescriptor fd, int width, int height);
+
+    /**
+     * Start a persistent native screencap daemon that loops /system/bin/screencap and streams
+     * raw RGBA frames over [fd].  Each frame is prefixed by an 8-byte little-endian header
+     * {width:int32, height:int32} followed by width*height*4 RGBA_8888 bytes.  The daemon runs
+     * until stopScreencapDaemon() is called or [fd] is closed (EPIPE causes exit).
+     * The caller must close its own copy of [fd] after this call (UserService takes ownership).
+     */
+    void startScreencapDaemon(in ParcelFileDescriptor fd);
+
+    /** Stop the screencap daemon started by startScreencapDaemon(). Idempotent. */
+    void stopScreencapDaemon();
 }
