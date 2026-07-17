@@ -46,4 +46,14 @@ interface IInputBridge {
      * closed before this method returns so the reader sees EOF.
      */
     void screencapToFd(in ParcelFileDescriptor fd);
+
+    /**
+     * Capture the display via SurfaceControl reflection — no subprocess per frame.
+     * On success writes {width:int, height:int} (8 bytes, little-endian) followed by
+     * BGRA_8888 pixels (width × height × 4 bytes) to [fd]. On failure (reflection not
+     * available on this device) writes nothing and closes [fd] immediately; the caller
+     * should detect the empty read and fall back to screencapToFd().
+     * width/height: requested output resolution (compositor scales on the GPU).
+     */
+    void screencapToFdBGRA(in ParcelFileDescriptor fd, int width, int height);
 }

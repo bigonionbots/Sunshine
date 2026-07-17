@@ -318,7 +318,7 @@ namespace video {
       sws_input_frame.reset(av_frame_alloc());
       sws_input_frame->width = in_width;
       sws_input_frame->height = in_height;
-      sws_input_frame->format = AV_PIX_FMT_BGR0;
+      sws_input_frame->format = AV_PIX_FMT_BGRA;
 
       sws_output_frame.reset(av_frame_alloc());
       sws_output_frame->width = out_width;

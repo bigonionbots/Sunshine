@@ -127,6 +127,23 @@ extern "C" {
   }
 
   /**
+   * @brief Deliver one captured BGRA_8888 frame from the app to the core.
+   * @details Faster than nativePushFrame — no per-pixel R/B swap; plain memcpy into g_frame.
+   *          Used by the SurfaceControl reflection capture path.
+   *
+   * @param buffer Direct ByteBuffer holding the frame pixels (BGRA_8888).
+   * @param width Frame width in pixels.
+   * @param height Frame height in pixels.
+   * @param row_stride Bytes per source row.
+   */
+  JNIEXPORT void JNICALL Java_dev_lizardbyte_sunshine_SunshineNative_nativePushFrameBGRA(JNIEnv *env, jclass, jobject buffer, jint width, jint height, jint row_stride) {
+    auto *pixels = static_cast<const std::uint8_t *>(env->GetDirectBufferAddress(buffer));
+    if (pixels) {
+      jni::push_frame_bgra(pixels, width, height, row_stride);
+    }
+  }
+
+  /**
    * @brief Notify the core that AudioPlaybackCapture has started.
    *
    * @param sample_rate Source sample rate in hertz.

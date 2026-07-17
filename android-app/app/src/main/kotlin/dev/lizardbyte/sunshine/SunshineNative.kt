@@ -37,6 +37,13 @@ object SunshineNative {
     external fun nativePushFrame(buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int)
 
     /**
+     * Deliver one captured BGRA_8888 frame (e.g. from Bitmap.copyPixelsToBuffer on ARM).
+     * Faster than [nativePushFrame] — no per-pixel R/B swap needed. [buffer] must be a direct
+     * ByteBuffer.
+     */
+    external fun nativePushFrameBGRA(buffer: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int)
+
+    /**
      * Notify the core that AudioPlaybackCapture has started at the given format.
      */
     external fun nativeAudioStarted(sampleRate: Int, channels: Int)

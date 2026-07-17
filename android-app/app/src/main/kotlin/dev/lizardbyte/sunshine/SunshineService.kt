@@ -71,7 +71,7 @@ class SunshineService : Service() {
         .daemon(false)
         .processNameSuffix("input")
         .debuggable(false)
-        .version(2)  // increment when IInputBridge AIDL changes to force UserService restart
+        .version(3)  // increment when IInputBridge AIDL changes to force UserService restart
     private val inputServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bridge = IInputBridge.Stub.asInterface(binder)
@@ -388,6 +388,8 @@ class SunshineService : Service() {
             // actual screencap dimensions differ (e.g. navigation bar, display cutout rounding).
             var announcedW = initW
             var announcedH = initH
+            // Start with the BGRA reflection path; flip to false if UserService returns empty.
+            var bgraCaptureFailed = false
             while (screencapRunning) {
                 val bridge = inputBridge
                 if (bridge == null) {
@@ -401,37 +403,66 @@ class SunshineService : Service() {
                     val writeFd = pipe[1]
 
                     // Read from the pipe on a separate thread to prevent the writer from blocking
-                    // when screencap output exceeds the kernel pipe buffer (~64 KB). The writer
-                    // (InputUserService.screencapToFd) runs synchronously over Binder — it would
-                    // deadlock if nothing is draining the pipe.
+                    // when output exceeds the kernel pipe buffer (~64 KB). The writer runs
+                    // synchronously over Binder and would deadlock if nothing drains the pipe.
                     var raw = ByteArray(0)
                     val reader = thread(isDaemon = true) {
                         ParcelFileDescriptor.AutoCloseInputStream(readFd).use { raw = it.readBytes() }
                     }
 
+                    // Prefer the BGRA reflection path (no subprocess); fall back to screencapToFd
+                    // if the UserService returned empty (reflection unsupported on this device).
+                    val isBgra = !bgraCaptureFailed
                     try {
-                        bridge.screencapToFd(writeFd)
+                        if (isBgra) bridge.screencapToFdBGRA(writeFd, announcedW, announcedH)
+                        else bridge.screencapToFd(writeFd)
                     } finally {
-                        writeFd.close()  // signal EOF; InputUserService already closed its dup
+                        writeFd.close()  // signal EOF; UserService already closed its dup
                     }
                     reader.join()
 
-                    if (raw.size < 12) {
-                        Log.w(TAG, "screencap: output too short (${raw.size} bytes)")
-                        Thread.sleep(300)
+                    if (isBgra && raw.size < 8) {
+                        // Empty response: SurfaceControl reflection not available on this device.
+                        Log.w(TAG, "screencap BGRA: reflection unavailable, switching to subprocess")
+                        bgraCaptureFailed = true
+                        Thread.sleep(100)
                         continue
                     }
-                    val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-                    val capW = hdr.getInt(0)
-                    val capH = hdr.getInt(4)
-                    val pixelBytes = capW * capH * 4
-                    val pixelOffset = when {
-                        raw.size == 12 + pixelBytes -> 12
-                        raw.size == 16 + pixelBytes -> 16  // newer Android prepends a dataspace field
-                        else -> {
-                            Log.w(TAG, "screencap: unexpected size ${raw.size} for ${capW}x${capH}")
+
+                    val capW: Int
+                    val capH: Int
+                    val pixelBytes: Int
+                    val pixelOffset: Int
+
+                    if (isBgra) {
+                        val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                        capW = hdr.getInt(0)
+                        capH = hdr.getInt(4)
+                        pixelBytes = capW * capH * 4
+                        pixelOffset = 8
+                        if (raw.size != pixelOffset + pixelBytes) {
+                            Log.w(TAG, "screencap BGRA: unexpected size ${raw.size} for ${capW}x${capH}")
                             Thread.sleep(300)
                             continue
+                        }
+                    } else {
+                        if (raw.size < 12) {
+                            Log.w(TAG, "screencap: output too short (${raw.size} bytes)")
+                            Thread.sleep(300)
+                            continue
+                        }
+                        val hdr = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                        capW = hdr.getInt(0)
+                        capH = hdr.getInt(4)
+                        pixelBytes = capW * capH * 4
+                        pixelOffset = when {
+                            raw.size == 12 + pixelBytes -> 12
+                            raw.size == 16 + pixelBytes -> 16  // newer Android: dataspace field
+                            else -> {
+                                Log.w(TAG, "screencap: unexpected size ${raw.size} for ${capW}x${capH}")
+                                Thread.sleep(300)
+                                continue
+                            }
                         }
                     }
 
@@ -451,7 +482,8 @@ class SunshineService : Service() {
                     }
                     directBuf.clear()
                     directBuf.put(raw, pixelOffset, pixelBytes)
-                    SunshineNative.nativePushFrame(directBuf, capW, capH, capW * 4)
+                    if (isBgra) SunshineNative.nativePushFrameBGRA(directBuf, capW, capH, capW * 4)
+                    else SunshineNative.nativePushFrame(directBuf, capW, capH, capW * 4)
                 } catch (e: InterruptedException) {
                     break
                 } catch (e: Exception) {

@@ -97,7 +97,7 @@ namespace jni {
   void capture_size(int &width, int &height);
 
   /**
-   * @brief Push one RGBA_8888 frame from the app; stored (converted to BGR0) as the latest frame.
+   * @brief Push one RGBA_8888 frame from the app; stored (converted to BGRA) as the latest frame.
    *
    * @param rgba Pointer to the source pixel data.
    * @param width Frame width in pixels.
@@ -107,7 +107,20 @@ namespace jni {
   void push_frame(const std::uint8_t *rgba, int width, int height, int row_stride);
 
   /**
-   * @brief Copy the latest captured frame (as AV_PIX_FMT_BGR0) into a destination buffer.
+   * @brief Push one BGRA_8888 frame from the app; stored as-is (memcpy) as the latest frame.
+   * @details Faster than push_frame() — no per-pixel R/B swap needed. Used by the
+   *          SurfaceControl reflection capture path where Bitmap.copyPixelsToBuffer() yields
+   *          native BGRA bytes on ARM.
+   *
+   * @param bgra Pointer to the source pixel data (BGRA_8888, possibly strided).
+   * @param width Frame width in pixels.
+   * @param height Frame height in pixels.
+   * @param row_stride Bytes per source row (may exceed width*4).
+   */
+  void push_frame_bgra(const std::uint8_t *bgra, int width, int height, int row_stride);
+
+  /**
+   * @brief Copy the latest captured frame (as AV_PIX_FMT_BGRA) into a destination buffer.
    *
    * @param dst Destination buffer.
    * @param expected_width Expected width; a mismatch yields frame_status::resize.

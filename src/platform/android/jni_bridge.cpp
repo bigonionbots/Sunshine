@@ -24,7 +24,7 @@ namespace jni {
     void *g_app_context = nullptr;  ///< Cached global reference to the host Context.
 
     std::mutex g_frame_mutex;  ///< Guards the latest captured frame.
-    std::vector<std::uint8_t> g_frame;  ///< Latest frame, tightly packed BGR0 (width*height*4).
+    std::vector<std::uint8_t> g_frame;  ///< Latest frame, tightly packed BGRA (width*height*4).
     int g_frame_w = 0;  ///< Latest frame width.
     int g_frame_h = 0;  ///< Latest frame height.
 
@@ -111,7 +111,7 @@ namespace jni {
     }
     std::lock_guard<std::mutex> lock(g_frame_mutex);
     g_frame.resize(static_cast<std::size_t>(width) * height * 4);
-    // Convert RGBA_8888 (possibly strided) to tightly-packed AV_PIX_FMT_BGR0 (B,G,R,X).
+    // Convert RGBA_8888 (possibly strided) to tightly-packed AV_PIX_FMT_BGRA (B,G,R,A).
     for (int y = 0; y < height; ++y) {
       const std::uint8_t *s = rgba + static_cast<std::size_t>(y) * row_stride;
       std::uint8_t *d = g_frame.data() + static_cast<std::size_t>(y) * width * 4;
@@ -119,10 +119,27 @@ namespace jni {
         d[0] = s[2];  // B
         d[1] = s[1];  // G
         d[2] = s[0];  // R
-        d[3] = 0;  // X
+        d[3] = s[3];  // A
         s += 4;
         d += 4;
       }
+    }
+    g_frame_w = width;
+    g_frame_h = height;
+  }
+
+  void push_frame_bgra(const std::uint8_t *bgra, int width, int height, int row_stride) {
+    if (!bgra || width <= 0 || height <= 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(g_frame_mutex);
+    g_frame.resize(static_cast<std::size_t>(width) * height * 4);
+    // BGRA_8888 is already our storage format — plain row-by-row memcpy, no per-pixel work.
+    const std::size_t dst_pitch = static_cast<std::size_t>(width) * 4;
+    for (int y = 0; y < height; ++y) {
+      std::memcpy(g_frame.data() + static_cast<std::size_t>(y) * dst_pitch,
+                  bgra + static_cast<std::size_t>(y) * row_stride,
+                  dst_pitch);
     }
     g_frame_w = width;
     g_frame_h = height;

@@ -1,9 +1,13 @@
 package dev.lizardbyte.sunshine
 
+import android.graphics.Bitmap
+import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.util.Log
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyCharacterMap
@@ -235,6 +239,219 @@ class InputUserService : IInputBridge.Stub() {
             proc?.destroy()
             runCatching { fd.close() }
         }
+    }
+
+    // Pre-allocated pixel storage reused across frames to avoid per-frame GC pressure.
+    @Volatile private var capturePixelBuf: ByteArray? = null
+    // Whether SurfaceControl reflection has been tested on this device (null = not yet).
+    @Volatile private var reflectionWorking: Boolean? = null
+
+    override fun screencapToFdBGRA(fd: ParcelFileDescriptor, width: Int, height: Int) {
+        try {
+            // Skip reflection if it's already been confirmed unavailable on this device.
+            val bitmap: Bitmap? = if (reflectionWorking != false) {
+                captureScreenReflection(width, height).also { bmp ->
+                    if (reflectionWorking == null) {
+                        reflectionWorking = bmp != null
+                        if (bmp == null) Log.w(TAG, "SurfaceControl reflection unavailable; screencapToFdBGRA will return empty")
+                    }
+                }
+            } else null
+
+            if (bitmap == null) {
+                // Signal to the caller that the reflection path isn't available.
+                return
+            }
+
+            val bw = bitmap.width
+            val bh = bitmap.height
+            val pixelBytes = bw * bh * 4
+
+            // Reuse the pixel buffer if large enough.
+            var pixBuf = capturePixelBuf
+            if (pixBuf == null || pixBuf.size < pixelBytes) {
+                pixBuf = ByteArray(pixelBytes)
+                capturePixelBuf = pixBuf
+            }
+
+            // Bitmap.copyPixelsToBuffer gives raw BGRA bytes on ARM (kN32 = kBGRA_8888 in Skia).
+            bitmap.copyPixelsToBuffer(ByteBuffer.wrap(pixBuf, 0, pixelBytes))
+            bitmap.recycle()
+
+            // Write 8-byte header (width, height as LE ints) followed by BGRA pixel data.
+            val hdr = ByteArray(8).also { ByteBuffer.wrap(it).order(ByteOrder.LITTLE_ENDIAN).putInt(bw).putInt(bh) }
+            FileOutputStream(fd.fileDescriptor).buffered(65536).use { out ->
+                out.write(hdr)
+                out.write(pixBuf, 0, pixelBytes)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "screencapToFdBGRA: ${e.message}")
+        } finally {
+            runCatching { fd.close() }
+        }
+    }
+
+    /**
+     * Try multiple hidden APIs to capture the display without spawning a subprocess.
+     * On Android 12+ uses [SurfaceControl.captureDisplay]; older devices fall back to
+     * [SurfaceControl.screenshot]. Returns null if all attempts fail.
+     */
+    private fun captureScreenReflection(targetW: Int, targetH: Int): Bitmap? {
+        // Approach 1: Android 12+ SurfaceControl.captureDisplay(DisplayCaptureArgs)
+        try {
+            val scClass = Class.forName("android.view.SurfaceControl")
+
+
+            // Obtain the primary display token.
+            val displayToken: IBinder = try {
+                scClass.getDeclaredMethod("getInternalDisplayToken")
+                    .apply { isAccessible = true }
+                    .invoke(null) as? IBinder
+                    ?: throw RuntimeException("getInternalDisplayToken returned null")
+            } catch (e: NoSuchMethodException) {
+                // Android 12+ replaced getInternalDisplayToken with getPhysicalDisplayToken.
+                val ids = scClass.getDeclaredMethod("getPhysicalDisplayIds")
+                    .apply { isAccessible = true }
+                    .invoke(null) as? LongArray
+                    ?: throw RuntimeException("getPhysicalDisplayIds returned null")
+                if (ids.isEmpty()) throw RuntimeException("no physical displays")
+                scClass.getDeclaredMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(null, ids[0]) as? IBinder
+                    ?: throw RuntimeException("getPhysicalDisplayToken returned null")
+            }
+
+            // Build DisplayCaptureArgs via its Builder inner class.
+            val builderClass = Class.forName("android.view.SurfaceControl\$DisplayCaptureArgs\$Builder")
+            val builder = builderClass.getDeclaredConstructor(IBinder::class.java)
+                .apply { isAccessible = true }
+                .newInstance(displayToken)
+            builderClass.getDeclaredMethod("setSize", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(builder, targetW, targetH)
+            val captureArgs = builderClass.getDeclaredMethod("build")
+                .apply { isAccessible = true }
+                .invoke(builder)
+
+            // Call SurfaceControl.captureDisplay(DisplayCaptureArgs).
+            val result = scClass.getDeclaredMethod(
+                "captureDisplay", Class.forName("android.view.SurfaceControl\$DisplayCaptureArgs"))
+                .apply { isAccessible = true }
+                .invoke(null, captureArgs)
+                ?: return null
+
+            // Extract software Bitmap from the returned ScreenshotHardwareBuffer.
+            val bmp = result.javaClass.getDeclaredMethod("asBitmap")
+                .apply { isAccessible = true }
+                .invoke(result) as? Bitmap
+                ?: return null
+            // Hardware-backed Bitmaps can't be read via copyPixelsToBuffer; copy to software.
+            return if (bmp.config == Bitmap.Config.HARDWARE) bmp.copy(Bitmap.Config.ARGB_8888, false) else bmp
+        } catch (e: Exception) {
+            Log.w(TAG, "captureDisplay reflection failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Approach 2: android.window.ScreenCapture.captureDisplay (Android 13) with display token
+        // from android.hardware.display.DisplayControl (ZUI moved these methods out of SurfaceControl).
+        try {
+            val displayToken: IBinder = getDisplayToken()
+                ?: throw RuntimeException("no display token available")
+
+            val builderClass = Class.forName("android.window.ScreenCapture\$DisplayCaptureArgs\$Builder")
+            val builder = builderClass.getDeclaredConstructor(IBinder::class.java)
+                .apply { isAccessible = true }
+                .newInstance(displayToken)
+            builderClass.getDeclaredMethod("setSize", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(builder, targetW, targetH)
+            val captureArgs = builderClass.getDeclaredMethod("build")
+                .apply { isAccessible = true }
+                .invoke(builder)
+
+            val scapClass = Class.forName("android.window.ScreenCapture")
+            val dcaClass = Class.forName("android.window.ScreenCapture\$DisplayCaptureArgs")
+            val result = scapClass.getDeclaredMethod("captureDisplay", dcaClass)
+                .apply { isAccessible = true }
+                .invoke(null, captureArgs)
+                ?: return null
+
+            val bmp = result.javaClass.getDeclaredMethod("asBitmap")
+                .apply { isAccessible = true }
+                .invoke(result) as? Bitmap
+                ?: return null
+            return if (bmp.config == Bitmap.Config.HARDWARE) bmp.copy(Bitmap.Config.ARGB_8888, false) else bmp
+        } catch (e: Exception) {
+            Log.w(TAG, "ScreenCapture.captureDisplay reflection failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Approach 3: deprecated SurfaceControl.screenshot(Rect, int, int[, int]) pre-Android 12.
+        try {
+            val scClass = Class.forName("android.view.SurfaceControl")
+            val m = try {
+                scClass.getDeclaredMethod("screenshot",
+                    android.graphics.Rect::class.java, Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+            } catch (_: NoSuchMethodException) {
+                scClass.getDeclaredMethod("screenshot",
+                    android.graphics.Rect::class.java, Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType)
+            }
+            m.isAccessible = true
+            val bmp = if (m.parameterCount == 4) {
+                m.invoke(null, null, targetW, targetH, 0)
+            } else {
+                m.invoke(null, null, targetW, targetH)
+            } as? Bitmap
+            return if (bmp?.config == Bitmap.Config.HARDWARE) bmp.copy(Bitmap.Config.ARGB_8888, false) else bmp
+        } catch (e: Exception) {
+            Log.w(TAG, "screenshot reflection failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        return null
+    }
+
+    /**
+     * Obtain the primary display's token (IBinder) by trying multiple hidden APIs.
+     * SurfaceControl.getPhysicalDisplayToken() was removed in ZUI; fallback paths include
+     * android.hardware.display.DisplayControl and android.view.SurfaceControl inner paths.
+     */
+    private fun getDisplayToken(): IBinder? {
+        // Try android.hardware.display.DisplayControl (some OEMs move these from SurfaceControl).
+        try {
+            val dcClass = Class.forName("android.hardware.display.DisplayControl")
+            val ids = dcClass.getDeclaredMethod("getPhysicalDisplayIds")
+                .apply { isAccessible = true }
+                .invoke(null) as? LongArray
+            if (ids != null && ids.isNotEmpty()) {
+                return dcClass.getDeclaredMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+                    .apply { isAccessible = true }
+                    .invoke(null, ids[0]) as? IBinder
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "DisplayControl token failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Try SurfaceControl.getInternalDisplayToken() (stock Android < 12 or some OEM builds).
+        try {
+            val scClass = Class.forName("android.view.SurfaceControl")
+            return scClass.getDeclaredMethod("getInternalDisplayToken")
+                .apply { isAccessible = true }
+                .invoke(null) as? IBinder
+        } catch (e: Exception) {
+            Log.w(TAG, "getInternalDisplayToken failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // Try SurfaceControl.getPhysicalDisplayToken(long) with ID 0 as a last resort.
+        try {
+            val scClass = Class.forName("android.view.SurfaceControl")
+            return scClass.getDeclaredMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+                .invoke(null, 0L) as? IBinder
+        } catch (e: Exception) {
+            Log.w(TAG, "getPhysicalDisplayToken(0L) failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        return null
     }
 
     // -----------------------------------------------------------------------------------------
